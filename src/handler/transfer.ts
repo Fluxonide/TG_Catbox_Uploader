@@ -485,20 +485,21 @@ export async function transferFromURL(msg: Api.Message) {
     log(`Uploaded ${filePath} from URL to ${service}`)
 
     if (LOG_CHANNEL_ID) {
-      // Send file info message first
-      const infoMsg = await bot
-        .sendMessage(LOG_CHANNEL_ID, {
-          message: `From: \`${chat}\`\nURL: \`${url}\`\nService: ${service}\nResult: \`${result}\``,
+      // Send image with compression and caption
+      const imageMsg = await bot
+        .sendFile(LOG_CHANNEL_ID, {
+          file: filePath,
+          caption: `URL: \`${url}\`\nService: ${service}\nResult: \`${result}\``,
         })
         .catch(() => null)
 
-      // Send as document to preserve original format
-      if (infoMsg) {
+      // Send raw file as document below it
+      if (imageMsg) {
         await bot
           .sendFile(LOG_CHANNEL_ID, {
             file: filePath,
             forceDocument: true,
-            replyTo: infoMsg.id,
+            replyTo: imageMsg.id,
           })
           .catch(() => null)
       }
