@@ -340,17 +340,21 @@ export async function transferFromURL(msg: Api.Message) {
       }
     }
 
-    // Determine file extension from Content-Type or URL
+    // Determine file extension from URL first, then Content-Type
     let fileExt = 'bin'
-    const contentType = response.headers.get('content-type')
-    if (contentType) {
-      const ext = mime.extension(contentType)
-      if (ext) fileExt = ext
+
+    // Try to get extension from URL first
+    const urlPath = new URL(url).pathname
+    const urlMatch = urlPath.match(/\.([^./?#]+)(?:[?#]|$)/)
+    if (urlMatch) {
+      fileExt = urlMatch[1]
     } else {
-      // Try to get extension from URL
-      const urlPath = new URL(url).pathname
-      const match = urlPath.match(/\.([^.]+)$/)
-      if (match) fileExt = match[1]
+      // Fall back to Content-Type if URL doesn't have extension
+      const contentType = response.headers.get('content-type')
+      if (contentType) {
+        const ext = mime.extension(contentType)
+        if (ext) fileExt = ext
+      }
     }
 
     while (fs.existsSync(`./cache/${chat}_${fileName}.${fileExt}`)) fileName = randomString()
