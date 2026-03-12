@@ -20,6 +20,7 @@
     "dotenv": "^16.0.0",
     "mime-types": "^2.1.34",
     "node-catbox": "^3.0.1",
+    "pnpm": "^10.32.1",
     "telegram": "^2.9.8"
   },
   "devDependencies": {
