@@ -11,10 +11,10 @@ export async function handleMessage(event: NewMessageEvent) {
   // Currently, only support private messages
   if (msg.peerId.className !== 'PeerUser') return
   const chatId = msg.peerId.userId.toString()
-  const lang = chatData[chatId].lang
 
   // Check if the user has configured the bot
   initChatData(chatId)
+  const lang = chatData[chatId].lang
   if (isCommand(msg.message)) await handleCommand(msg)
   else if (msg.media) await transfer(msg)
   else {
