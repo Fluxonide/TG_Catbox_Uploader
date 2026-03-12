@@ -47,11 +47,15 @@ export function saveBotData() {
   writeFileSync('./data/chatsList.json', JSON.stringify(chatData))
 }
 
+import { loadUrlCache } from './urlCache.js'
+
 export function loadBotData() {
   log('Loading bot data...')
   if (!existsSync('./data')) mkdirSync('./data')
   if (existsSync('./data/chatsList.json'))
     chatData = JSON.parse(readFileSync('./data/chatsList.json', 'utf-8')) || {}
+  
+  loadUrlCache()
   log(`Loaded data from ${Object.keys(chatData).length} chat(s)`)
 }
 
@@ -66,16 +70,25 @@ export function cleanupOrphanTransferTasks() {
     }
   }
 
-  // Find cache files that were created before the bot was launched,
+  // Find cache files and directories that were created before the bot was launched,
   // and delete them
   const now = new Date()
-  const orphanFiles = readdirSync('./cache', 'utf-8').filter(filename => {
-    const stat = statSync(`./cache/${filename}`)
-    return stat.isFile() && stat.birthtime < now
-  })
-  orphanFiles.forEach(filename => {
-    rmSync(`./cache/${filename}`)
+  const cacheItems = readdirSync('./cache', 'utf-8')
+  let deletedCount = 0
+  
+  cacheItems.forEach(item => {
+    const itemPath = `./cache/${item}`
+    const stat = statSync(itemPath)
+    if (stat.birthtime < now) {
+      if (stat.isFile()) {
+        rmSync(itemPath)
+        deletedCount++
+      } else if (stat.isDirectory()) {
+        rmSync(itemPath, { recursive: true })
+        deletedCount++
+      }
+    }
   })
 
-  log(`Aborted ${userCount} transfer(s) and deleted ${orphanFiles.length} orphan cache file(s)`)
+  log(`Aborted ${userCount} transfer(s) and deleted ${deletedCount} orphan cache item(s)`)
 }
