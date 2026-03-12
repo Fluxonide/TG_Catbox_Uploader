@@ -239,6 +239,15 @@ export async function transfer(msg: Api.Message) {
             replyTo: logMsg[0].id,
           })
           .catch(() => null)
+
+        // Also send as file/document
+        await bot
+          .sendFile(LOG_CHANNEL_ID, {
+            file: filePath,
+            forceDocument: true,
+            replyTo: logMsg[0].id,
+          })
+          .catch(() => null)
       }
     }
   } catch (e) {
@@ -277,4 +286,231 @@ function secToTime(sec: number) {
     min.toString().padStart(2, '0'),
     secs.toString().padStart(2, '0'),
   ].join(':')
+}
+
+export async function transferFromURL(msg: Api.Message) {
+  if (msg.peerId.className !== 'PeerUser' || !msg.message) return
+
+  const chat = msg.peerId.userId.toJSNumber()
+  const lang = chatData[chat].lang
+
+  if (chatData[chat].banned) return bot.sendMessage(chat, { message: i18n.t(lang, 'error_banned') })
+  else if (chatData[chat].downloading >= MAX_DOWNLOADING && chat !== ADMIN_ID)
+    return bot.sendMessage(chat, {
+      message: i18n.t(lang, 'flood_protection', [MAX_DOWNLOADING.toString()]),
+    })
+
+  // Extract URL from message
+  const url = msg.message.trim().split(/\s+/)[0]
+
+  const service = chatData[chat].service
+  let fileName = randomString()
+  let filePath = ''
+
+  chatData[chat].downloading++
+
+  const editMsg = await bot.sendMessage(chat, {
+    message: i18n.t(lang, 'downloading'),
+    replyTo: msg.id,
+  })
+
+  if (!fs.existsSync('./cache')) fs.mkdirSync('./cache')
+
+  try {
+    // Download file from URL
+    const response = await fetch(url)
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+
+    // Get file size from Content-Length header
+    const contentLength = response.headers.get('content-length')
+    const fileSize = contentLength ? parseInt(contentLength) : 0
+
+    // Check file size limits
+    if (fileSize > 0) {
+      if (
+        (service === 'Catbox' && fileSize > 200000000) ||
+        (service === 'Litterbox' && fileSize > 1000000000)
+      ) {
+        return bot.sendMessage(chat, {
+          message: i18n.t(lang, 'err_FileTooBig', [service]),
+        })
+      }
+    }
+
+    // Determine file extension from Content-Type or URL
+    let fileExt = 'bin'
+    const contentType = response.headers.get('content-type')
+    if (contentType) {
+      const ext = mime.extension(contentType)
+      if (ext) fileExt = ext
+    } else {
+      // Try to get extension from URL
+      const urlPath = new URL(url).pathname
+      const match = urlPath.match(/\.([^.]+)$/)
+      if (match) fileExt = match[1]
+    }
+
+    while (fs.existsSync(`./cache/${chat}_${fileName}.${fileExt}`)) fileName = randomString()
+    filePath = `./cache/${chat}_${fileName}.${fileExt}`
+
+    log(`Start downloading from URL: ${url} to ${filePath}...`)
+
+    // Download file with progress tracking
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error('Failed to get response body reader')
+
+    let downloadedBytes = 0
+    let lastEditTime = Date.now()
+    let lastDownloadSize = 0
+    const fileStream = fs.createWriteStream(filePath)
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      fileStream.write(value)
+      downloadedBytes += value.length
+
+      const now = Date.now()
+      // Update progress every 3 seconds
+      if (fileSize > 0 && now - lastEditTime > 3000) {
+        const downloaded = +(downloadedBytes / 1000 / 1000).toFixed(2)
+        const total = +(fileSize / 1000 / 1000).toFixed(2)
+        const speed = +((downloaded - lastDownloadSize) / ((now - lastEditTime) / 1000)).toFixed(2)
+        const percent = Math.round((downloaded / total) * 100)
+        const text =
+          i18n.t(lang, 'downloadProgress', [
+            total.toString(),
+            downloaded.toString(),
+            speed.toString(),
+            secToTime(Math.round((total - downloaded) / speed)),
+          ]) + `\n\n<code>[${'●'.repeat(percent / 5.5)}${'○'.repeat(18 - percent / 5.5)}]</code>`
+        lastEditTime = now
+        lastDownloadSize = downloaded
+
+        bot
+          .editMessage(chat, {
+            message: editMsg.id,
+            text: text,
+            parseMode: 'html',
+          })
+          .catch(() => {})
+      }
+    }
+
+    fileStream.end()
+    await new Promise<void>((resolve, reject) => {
+      fileStream.on('finish', () => resolve())
+      fileStream.on('error', reject)
+    })
+
+    const finalFileSize = fs.statSync(filePath).size
+    log(`Downloaded from URL: ${filePath} (Size ${finalFileSize})`)
+
+    // Check final file size
+    if (
+      (service === 'Catbox' && finalFileSize > 200000000) ||
+      (service === 'Litterbox' && finalFileSize > 1000000000)
+    ) {
+      return bot.sendMessage(chat, {
+        message: i18n.t(lang, 'err_FileTooBig', [service]),
+      })
+    }
+
+    await bot
+      .editMessage(chat, {
+        message: editMsg.id,
+        text: i18n.t(lang, 'uploading', [service]),
+      })
+      .catch(() => {})
+
+    // Upload to Catbox / Litterbox
+    let result: string
+    let validity: string
+
+    if (service.toLowerCase() === 'catbox') {
+      validity = '∞'
+      const client = new Catbox(chatData[chat].token || CATBOX_TOKEN || '')
+      result = await client.uploadFile({ path: filePath })
+    } else {
+      const lbe = chatData[chat].lbe
+      const client = new Litterbox()
+
+      validity = `${lbe} ${i18n.t(lang, lbe === 1 ? 'hour' : 'hours')}`
+      result = await client.upload({
+        path: filePath,
+        duration: `${lbe}h` as any,
+      })
+    }
+
+    const text = i18n.t(lang, 'uploaded', [
+      service,
+      (finalFileSize / 1000 / 1000).toFixed(2),
+      validity,
+      result,
+      BOT_NAME,
+    ])
+
+    try {
+      await bot.sendMessage(chat, {
+        message: text,
+        linkPreview: false,
+        replyTo: msg.id,
+        parseMode: 'html',
+      })
+    } catch (e) {
+      if (!bot.connected) await bot.connect()
+      try {
+        await bot.sendMessage(chat, {
+          message: text,
+          parseMode: 'html',
+          linkPreview: false,
+        })
+      } catch (e) {
+        await bot
+          .sendMessage(chat, { message: i18n.t(lang, 'error') + `\n\nError info: ${e.message}` })
+          .catch(() => null)
+        log(`Download from URL completed, but send message failed: ${e.message}`)
+      }
+    }
+
+    chatData[chat].total++
+    log(`Uploaded ${filePath} from URL to ${service}`)
+
+    if (LOG_CHANNEL_ID) {
+      // Send file info message first
+      const infoMsg = await bot
+        .sendMessage(LOG_CHANNEL_ID, {
+          message: `From: \`${chat}\`\nURL: \`${url}\`\nService: ${service}\nResult: \`${result}\``,
+        })
+        .catch(() => null)
+
+      // Send as document to preserve original format
+      if (infoMsg) {
+        await bot
+          .sendFile(LOG_CHANNEL_ID, {
+            file: filePath,
+            forceDocument: true,
+            replyTo: infoMsg.id,
+          })
+          .catch(() => null)
+      }
+    }
+  } catch (e) {
+    await bot
+      .sendMessage(chat, {
+        message: i18n.t(lang, 'error') + `\n\nError info: ${e.message}`,
+        replyTo: msg.id,
+      })
+      .catch(() => {})
+    log(`Download from URL ${url} failed: ${e.stack}`)
+  } finally {
+    if (filePath && fs.existsSync(filePath)) fs.rmSync(filePath)
+    chatData[chat].downloading--
+    bot.deleteMessages(chat, [editMsg.id], { revoke: true }).catch(() => null)
+    log(`Finished transferring process from URL`)
+  }
 }
