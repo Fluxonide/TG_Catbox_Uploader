@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import i18n from '../i18n/index.js'
 import mime from 'mime-types'
 import bigInt from 'big-integer'
+import sharp from 'sharp'
 import { chatData, log } from './data.js'
 import { bot, BOT_NAME } from '../../index.js'
 import { Catbox, Litterbox } from 'node-catbox'
@@ -19,103 +20,323 @@ import type { Api } from 'telegram'
 // Queue for ordered log channel messages
 interface LogQueueItem {
   index: number
-  filePath: string
   url: string
   service: string
-  result: string
-}
-
-interface LogQueueEntry {
-  item: LogQueueItem
+  result: string | null
+  filePath: string
+  imageMsg: Api.Message | null
   resolve: () => void
 }
 
-const logQueue: Map<number, LogQueueEntry[]> = new Map()
+const logQueue: Map<number, LogQueueItem[]> = new Map()
 const logProcessing: Map<number, boolean> = new Map()
-const logSentIndices: Map<number, Set<number>> = new Map()
+const logSentIndices: Map<number, Set<string>> = new Map()
+const chatBatchLocks: Map<number, Promise<void>> = new Map()
+
+// Create a compressed preview for large images
+async function createCompressedPreview(filePath: string, maxSize = 2560): Promise<string | null> {
+  try {
+    const previewPath = filePath.replace(/\.(jpg|jpeg|png|webp)$/i, '_preview.jpg')
+
+    await sharp(filePath)
+      .resize(maxSize, maxSize, {
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .jpeg({
+        quality: 80,
+        progressive: false,
+      })
+      .toFile(previewPath)
+
+    const previewSize = fs.statSync(previewPath).size
+
+    // If preview is still > 5MB, reduce quality further
+    if (previewSize > 5000000) {
+      await sharp(filePath)
+        .resize(maxSize, maxSize, {
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .jpeg({
+          quality: 75,
+          progressive: false,
+        })
+        .toFile(previewPath)
+    }
+
+    const finalSize = fs.statSync(previewPath).size
+    log(`[Log] Created preview: ${(finalSize / 1000 / 1000).toFixed(2)} MB`)
+
+    return previewPath
+  } catch (e) {
+    log(`[Log] Failed to create preview: ${e.message}`)
+    return null
+  }
+}
 
 async function sendToLogChannel(chat: number, item: LogQueueItem) {
-  if (!LOG_CHANNEL_ID) return
+  if (!LOG_CHANNEL_ID) {
+    item.resolve() // Resolve immediately if no log channel
+    return
+  }
+
+  log(`[Log] Adding to queue: ${item.url} (index ${item.index}) for chat ${chat}`)
 
   // Init tracking structures for this chat
   if (!logSentIndices.has(chat)) {
     logSentIndices.set(chat, new Set())
   }
-  if (!logQueue.has(chat)) {
-    logQueue.set(chat, [])
-  }
 
   const sentSet = logSentIndices.get(chat)!
 
   // Skip if already sent (dedup)
-  if (sentSet.has(item.index)) {
-    log(`[Log] Skipping duplicate index ${item.index} for chat ${chat}`)
+  if (sentSet.has(item.url)) {
+    log(`[Log] Skipping duplicate URL ${item.url} for chat ${chat}`)
+    item.resolve() // Resolve immediately if already sent
     return
   }
 
-  // Create a promise that resolves when THIS item is processed
-  const itemDone = new Promise<void>(resolve => {
-    const queue = logQueue.get(chat)!
-    queue.push({ item, resolve })
-    queue.sort((a, b) => a.item.index - b.item.index)
-  })
+  // Add to queue
+  if (!logQueue.has(chat)) {
+    logQueue.set(chat, [])
+  }
+  const queue = logQueue.get(chat)!
+  queue.push(item)
+  queue.sort((a, b) => a.index - b.index) // Sort by index to maintain order
+
+  log(`[Log] Queue size for chat ${chat}: ${queue.length}`)
 
   // Start processing loop if not already running
   if (!logProcessing.get(chat)) {
     logProcessing.set(chat, true)
-    // Don't fire-and-forget: process inline so we catch late arrivals
-    processLogQueue(chat)
+    log(`[Log] Starting queue processor for chat ${chat}`)
+    // Process queue in background
+    processLogQueue(chat).catch(e => log(`Log queue error: ${e.message}`))
   }
-
-  // Wait until this specific item has been sent
-  await itemDone
 }
 
 async function processLogQueue(chat: number) {
   const queue = logQueue.get(chat)!
   const sentSet = logSentIndices.get(chat)!
 
+  log(`[Log] Processing queue for chat ${chat}, queue length: ${queue.length}`)
+
   while (queue.length > 0) {
-    const entry = queue[0]
+    // Sort queue by index to maintain order
+    queue.sort((a, b) => a.index - b.index)
+
+    const item = queue[0]
+
+    log(`[Log] Processing item: ${item.url} (index ${item.index})`)
 
     // Dedup check
-    if (sentSet.has(entry.item.index)) {
+    if (sentSet.has(item.url)) {
+      log(`[Log] Already sent, skipping: ${item.url}`)
       queue.shift()
-      entry.resolve()
+      item.resolve()
+      continue
+    }
+
+    // Check if file still exists before processing
+    if (!item.url.startsWith('tg-file-') && item.filePath && !fs.existsSync(item.filePath)) {
+      log(`[Log] File no longer exists, skipping: ${item.filePath}`)
+      queue.shift()
+      item.resolve()
       continue
     }
 
     try {
-      const imageMsg = await bot
-        .sendFile(LOG_CHANNEL_ID, {
-          file: entry.item.filePath,
-          caption: `Source: \`${entry.item.url}\`\nService: ${entry.item.service}\nResult: \`${entry.item.result}\``,
-        })
-        .catch(() => null)
-
-      if (imageMsg) {
-        await bot
-          .sendFile(LOG_CHANNEL_ID, {
-            file: entry.item.filePath,
-            forceDocument: true,
-            replyTo: imageMsg.id,
+      if (item.url.startsWith('tg-file-') && item.imageMsg) {
+        // Direct media upload: forward the original message
+        let fwdMsg: Api.Message | null = null
+        const fwdResult = await bot
+          .forwardMessages(LOG_CHANNEL_ID, {
+            messages: item.imageMsg.id,
+            fromPeer: chat,
           })
           .catch(() => null)
+        if (fwdResult && fwdResult.length > 0) {
+          fwdMsg = fwdResult[0] as Api.Message
+        }
+
+        if (fwdMsg) {
+          await bot
+            .sendMessage(LOG_CHANNEL_ID, {
+              message: `Service: ${item.service}\nResult: \`${item.result}\``,
+              replyTo: fwdMsg.id,
+            })
+            .catch(() => null)
+
+          if (item.filePath && fs.existsSync(item.filePath)) {
+            await bot
+              .sendFile(LOG_CHANNEL_ID, {
+                file: item.filePath,
+                forceDocument: true,
+                replyTo: fwdMsg.id,
+              })
+              .catch(() => null)
+          }
+        }
+      } else {
+        // URL upload: we have the downloaded file locally
+        let captionStr = `Source: \`${item.url}\`\nService: ${item.service}\nResult: \`${item.result}\``
+
+        log(
+          `[Log] Sending URL upload to log channel: ${item.url}, file exists: ${item.filePath && fs.existsSync(item.filePath)}`,
+        )
+
+        if (item.filePath && fs.existsSync(item.filePath)) {
+          const fileSize = fs.statSync(item.filePath).size
+          const fileSizeMB = (fileSize / 1000 / 1000).toFixed(2)
+
+          try {
+            const uploadTimeout = fileSize > 10000000 ? 120000 : 60000
+            let previewPath: string | null = null
+            let imageMsg: Api.Message | null = null
+
+            // Always create compressed preview for all images
+            if (/\.(jpg|jpeg|png|webp)$/i.test(item.filePath)) {
+              log(`[Log] Creating compressed preview...`)
+              previewPath = await createCompressedPreview(item.filePath)
+            }
+
+            // Try to send preview (or original if small) as compressed photo
+            const fileToSend = previewPath || item.filePath
+            imageMsg = (await Promise.race([
+              bot.sendFile(LOG_CHANNEL_ID, {
+                file: fileToSend,
+                caption: captionStr,
+                forceDocument: false,
+                attributes: [],
+              }),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+              ),
+            ]).catch(e => {
+              log(`[Log] Failed to send compressed photo: ${e.message}`)
+              // If AUTH_KEY_DUPLICATED, wait and let other operations complete
+              if (e.message.includes('AUTH_KEY_DUPLICATED')) {
+                return new Promise(resolve => setTimeout(() => resolve(null), 2000))
+              }
+              return null
+            })) as Api.Message | null
+
+            // If compressed photo failed, create smaller preview and retry
+            if (!imageMsg && previewPath) {
+              log(`[Log] Creating smaller preview (1920px)...`)
+              if (fs.existsSync(previewPath)) fs.rmSync(previewPath)
+              previewPath = await createCompressedPreview(item.filePath, 1920)
+
+              if (previewPath) {
+                imageMsg = (await Promise.race([
+                  bot.sendFile(LOG_CHANNEL_ID, {
+                    file: previewPath,
+                    caption: captionStr,
+                    forceDocument: false,
+                    attributes: [],
+                  }),
+                  new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+                  ),
+                ]).catch(e => {
+                  log(`[Log] Failed to send smaller preview: ${e.message}`)
+                  return null
+                })) as Api.Message | null
+              }
+            }
+
+            // Last resort: send as document
+            if (!imageMsg) {
+              log(`[Log] Sending as document (fallback)...`)
+              imageMsg = (await Promise.race([
+                bot.sendFile(LOG_CHANNEL_ID, {
+                  file: fileToSend,
+                  caption: captionStr,
+                  forceDocument: true,
+                  attributes: [],
+                }),
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+                ),
+              ]).catch(e => {
+                log(`[Log] Failed to send as document: ${e.message}`)
+                return null
+              })) as Api.Message | null
+            }
+
+            if (imageMsg) {
+              // Always send original file as document reply
+              await Promise.race([
+                bot.sendFile(LOG_CHANNEL_ID, {
+                  file: item.filePath,
+                  forceDocument: true,
+                  replyTo: imageMsg.id,
+                }),
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+                ),
+              ]).catch(e => {
+                log(`[Log] Failed to send raw document: ${e.message}`)
+              })
+            } else {
+              // Fallback: send just the caption if file upload failed
+              log(`[Log] File upload failed, sending caption only`)
+              await bot
+                .sendMessage(LOG_CHANNEL_ID, {
+                  message: captionStr + `\n\n⚠️ File upload failed (${fileSizeMB} MB)`,
+                })
+                .catch(() => null)
+            }
+
+            // Clean up preview file
+            if (previewPath && fs.existsSync(previewPath)) {
+              fs.rmSync(previewPath)
+            }
+          } catch (e) {
+            log(`[Log] Error uploading to log channel: ${e.message}`)
+            // Send caption only as fallback
+            await bot
+              .sendMessage(LOG_CHANNEL_ID, {
+                message: captionStr + `\n\n⚠️ File upload error: ${e.message}`,
+              })
+              .catch(() => null)
+          }
+        } else {
+          // File missing (e.g. it was too big to download), just send text
+          await bot.sendMessage(LOG_CHANNEL_ID, { message: captionStr }).catch(() => null)
+        }
       }
 
-      sentSet.add(entry.item.index)
+      sentSet.add(item.url)
+      log(`[Log] Marked as sent: ${item.url}`)
 
-      // Delay to avoid flood
-      await new Promise(resolve => setTimeout(resolve, 3000))
+      // Longer delay to avoid AUTH_KEY_DUPLICATED errors
+      const delayMs = 5000 // 5 seconds between log uploads
+      await new Promise(resolve => setTimeout(resolve, delayMs))
     } catch (e) {
-      log(`Failed to send to log channel: ${e.message}`)
+      log(`Failed to send to log channel: ${e.message || e}`)
+      // Try to send at least a text message as fallback
+      try {
+        await bot
+          .sendMessage(LOG_CHANNEL_ID, {
+            message: `Source: \`${item.url}\`\nService: ${item.service}\nResult: \`${item.result}\`\n\n⚠️ Error: ${e.message || e}`,
+          })
+          .catch(() => null)
+      } catch (_) {
+        // Ignore if even text message fails
+      }
+      // Mark as sent even on error to avoid infinite retries
+      sentSet.add(item.url)
     }
 
     queue.shift()
-    entry.resolve()
+    item.resolve()
+    log(`[Log] Removed from queue: ${item.url}, remaining: ${queue.length}`)
   }
 
   logProcessing.set(chat, false)
+  log(`[Log] Queue processor stopped for chat ${chat}`)
 }
 
 export async function transfer(msg: Api.Message) {
@@ -282,7 +503,8 @@ export async function transfer(msg: Api.Message) {
       bot
         .editMessage(chat, {
           message: editMsg.id,
-          text: `<b>📤 Uploading to ${service}${dots}</b>\n\n` +
+          text:
+            `<b>📤 Uploading to ${service}${dots}</b>\n\n` +
             `📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB\n` +
             `<code>[${bar}]</code>`,
           parseMode: 'html',
@@ -345,29 +567,23 @@ export async function transfer(msg: Api.Message) {
     chatData[chat].total++
     log(`Uploaded ${filePath} to ${service}`)
     if (LOG_CHANNEL_ID) {
-      const logMsg = await bot
-        .forwardMessages(LOG_CHANNEL_ID, {
-          messages: msg.id,
-          fromPeer: chat,
-        })
-        .catch(() => null)
-      if (logMsg) {
-        await bot
-          .sendMessage(LOG_CHANNEL_ID, {
-            message: `From: \`${chat}\`\nService: ${service}\nResult: \`${result}\``,
-            replyTo: logMsg[0].id,
-          })
-          .catch(() => null)
+      // For direct file transfers, we don't have a URL, so we use a placeholder.
+      // The index is used for ordering in the log queue.
+      let resolveLogPromise: () => void
+      const logPromise = new Promise<void>(resolve => {
+        resolveLogPromise = resolve
+      })
 
-        // Also send as file/document
-        await bot
-          .sendFile(LOG_CHANNEL_ID, {
-            file: filePath,
-            forceDocument: true,
-            replyTo: logMsg[0].id,
-          })
-          .catch(() => null)
-      }
+      await sendToLogChannel(chat, {
+        index: msg.id, // Use message ID as index for ordering
+        url: `tg-file-${msg.id}`, // Unique identifier for dedup
+        service,
+        result,
+        filePath,
+        imageMsg: msg,
+        resolve: resolveLogPromise!,
+      })
+      await logPromise // Wait for this specific log item to be processed
     }
   } catch (e) {
     clearTimeout(dlChunkTimeout)
@@ -428,140 +644,177 @@ export async function transferFromURL(msg: Api.Message) {
 
   if (urls.length === 0) return
 
-  const startTime = Date.now()
+  // Implement per-chat batch queueing
+  if (chatBatchLocks.has(chat)) {
+    const queueMsg = await bot
+      .sendMessage(chat, {
+        message: `⏳ <b>Task Queued!</b>\nYour batch of ${urls.length} links is waiting for your previous batch to finish...`,
+        replyTo: msg.id,
+        parseMode: 'html',
+      })
+      .catch(() => null)
 
-  // Send initial message
-  const statusMsg = await bot.sendMessage(chat, {
-    message: `<b>📥 Batch Upload</b>\n\n0/${urls.length} completed\n<code>[${buildProgressBar(0)}]</code> 0%\n⏱ ETA: calculating...`,
-    replyTo: msg.id,
-    parseMode: 'html',
+    try {
+      await chatBatchLocks.get(chat)
+    } finally {
+      if (queueMsg) bot.deleteMessages(chat, [queueMsg.id], { revoke: true }).catch(() => null)
+    }
+  }
+
+  let resolveBatchParam!: () => void
+  const currentBatchPromise = new Promise<void>(resolve => {
+    resolveBatchParam = resolve
   })
+  chatBatchLocks.set(chat, currentBatchPromise)
 
-  let completed = 0
-  let failed = 0
-  const results: Array<{ index: number; result: string | null }> = []
-  const failedUrls: Array<{ index: number; url: string; error: string }> = []
-  let lastUpdateTime = 0
+  try {
+    const startTime = Date.now()
 
-  // Concurrency limit: process up to N URLs at once, but stagger start times
-  const concurrency = chat === ADMIN_ID ? Math.min(MAX_DOWNLOADING, 4) : Math.min(MAX_DOWNLOADING, 3)
-  const staggerDelayMs = 1500 // delay between starting each concurrent download
+    // Send initial message
+    const statusMsg = await bot.sendMessage(chat, {
+      message: `<b>📥 Batch Upload</b>\n\n0/${urls.length} completed\n<code>[${buildProgressBar(0)}]</code> 0%\n⏱ ETA: calculating...`,
+      replyTo: msg.id,
+      parseMode: 'html',
+    })
 
-  // Update progress message helper
-  const updateProgress = async (force = false) => {
-    const now = Date.now()
-    if (!force && now - lastUpdateTime < 3000) return
-    lastUpdateTime = now
+    let completed = 0
+    let failed = 0
+    const results: Array<{ index: number; result: string | null }> = []
+    const failedUrls: Array<{ index: number; url: string; error: string }> = []
+    let lastUpdateTime = 0
 
-    const totalProcessed = completed + failed
-    const progress = Math.round((totalProcessed / urls.length) * 100)
-    const elapsed = (now - startTime) / 1000
-    const avgTimePerUrl = totalProcessed > 0 ? elapsed / totalProcessed : 0
-    const remaining = urls.length - totalProcessed
-    const eta = totalProcessed > 0 ? Math.round(avgTimePerUrl * remaining) : 0
+    // Concurrency limit: process up to N URLs at once, but stagger start times
+    const concurrency =
+      chat === ADMIN_ID ? Math.min(MAX_DOWNLOADING, 4) : Math.min(MAX_DOWNLOADING, 3)
+    const staggerDelayMs = 1500 // delay between starting each concurrent download
 
-    const activeCount = Math.min(concurrency, urls.length - totalProcessed)
+    // Update progress message helper
+    const updateProgress = async (force = false) => {
+      const now = Date.now()
+      if (!force && now - lastUpdateTime < 3000) return
+      lastUpdateTime = now
 
-    let text = `<b>📥 Batch Upload</b>\n\n`
-    text += `✅ ${completed} | ❌ ${failed} | 📊 ${totalProcessed}/${urls.length}\n`
-    text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
-    text += `⏱ ETA: <code>${secToTime(eta)}</code> | ⚡ ${activeCount} active`
+      const totalProcessed = completed + failed
+      const progress = Math.round((totalProcessed / urls.length) * 100)
+      const elapsed = (now - startTime) / 1000
+      const avgTimePerUrl = totalProcessed > 0 ? elapsed / totalProcessed : 0
+      const remaining = urls.length - totalProcessed
+      const eta = totalProcessed > 0 ? Math.round(avgTimePerUrl * remaining) : 0
 
+      const activeCount = Math.min(concurrency, urls.length - totalProcessed)
+
+      let text = `<b>📥 Batch Upload</b>\n\n`
+      text += `✅ ${completed} | ❌ ${failed} | 📊 ${totalProcessed}/${urls.length}\n`
+      text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
+      text += `⏱ ETA: <code>${secToTime(eta)}</code> | ⚡ ${activeCount} active`
+
+      if (failedUrls.length > 0) {
+        const failedList = failedUrls
+          .sort((a, b) => a.index - b.index)
+          .map(f => `${f.index + 1}. <code>${f.url}</code>\n   ⚠️ ${f.error}`)
+          .join('\n')
+        text += `\n\n<b>❌ Failed:</b>\n${failedList}`
+      }
+
+      await bot
+        .editMessage(chat, {
+          message: statusMsg.id,
+          text,
+          parseMode: 'html',
+          linkPreview: false,
+        })
+        .catch(() => {})
+    }
+
+    // Process with controlled concurrency using a semaphore pattern
+    const processUrl = async (url: string, urlIndex: number) => {
+      try {
+        const result = await transferSingleURL(msg, url, urlIndex + 1, urls.length, statusMsg.id)
+        if (result) {
+          completed++
+          results.push({ index: urlIndex, result })
+        } else {
+          failed++
+          failedUrls.push({
+            index: urlIndex,
+            url,
+            error: 'Failed to process (file too big or empty)',
+          })
+        }
+      } catch (error) {
+        failed++
+        failedUrls.push({ index: urlIndex, url, error: error.message || 'Unknown error' })
+      }
+      await updateProgress()
+    }
+
+    // Semaphore-based concurrency control with staggered starts
+    let activeCount = 0
+    let nextIndex = 0
+    const allDone = new Promise<void>(resolve => {
+      const tryStartNext = () => {
+        while (activeCount < concurrency && nextIndex < urls.length) {
+          const idx = nextIndex++
+          activeCount++
+          // Stagger start: add delay based on position within the concurrent batch
+          const staggerDelay = (activeCount - 1) * staggerDelayMs
+          setTimeout(() => {
+            processUrl(urls[idx], idx).finally(() => {
+              activeCount--
+              if (completed + failed === urls.length) {
+                resolve()
+              } else {
+                tryStartNext()
+              }
+            })
+          }, staggerDelay)
+        }
+      }
+      tryStartNext()
+    })
+
+    // Periodic progress update while processing
+    const progressInterval = setInterval(() => {
+      updateProgress()
+    }, 5000)
+
+    await allDone
+    clearInterval(progressInterval)
+
+    // Final update with summary
+    const totalElapsed = (Date.now() - startTime) / 1000
+
+    let finalText = `<b>✅ Batch Upload Complete!</b>\n\n`
+    finalText += `📊 ${completed}/${urls.length} successful${failed > 0 ? ` | ❌ ${failed} failed` : ''}\n`
+    finalText += `⏱ Total time: <code>${secToTime(Math.round(totalElapsed))}</code>\n`
+
+    // Only show failed URLs
     if (failedUrls.length > 0) {
       const failedList = failedUrls
         .sort((a, b) => a.index - b.index)
         .map(f => `${f.index + 1}. <code>${f.url}</code>\n   ⚠️ ${f.error}`)
         .join('\n')
-      text += `\n\n<b>❌ Failed:</b>\n${failedList}`
+      finalText += `\n<b>❌ Failed:</b>\n${failedList}`
     }
 
     await bot
       .editMessage(chat, {
         message: statusMsg.id,
-        text,
+        text: finalText,
         parseMode: 'html',
         linkPreview: false,
       })
       .catch(() => {})
-  }
 
-  // Process with controlled concurrency using a semaphore pattern
-  const processUrl = async (url: string, urlIndex: number) => {
-    try {
-      const result = await transferSingleURL(msg, url, urlIndex + 1, urls.length, statusMsg.id)
-      if (result) {
-        completed++
-        results.push({ index: urlIndex, result })
-      } else {
-        failed++
-        failedUrls.push({ index: urlIndex, url, error: 'Failed to process (file too big or empty)' })
-      }
-    } catch (error) {
-      failed++
-      failedUrls.push({ index: urlIndex, url, error: error.message || 'Unknown error' })
+    log(
+      `Batch upload for chat ${chat}: ${completed} success, ${failed} failed, ${urls.length} total in ${Math.round(totalElapsed)}s`,
+    )
+  } finally {
+    resolveBatchParam()
+    if (chatBatchLocks.get(chat) === currentBatchPromise) {
+      chatBatchLocks.delete(chat)
     }
-    await updateProgress()
   }
-
-  // Semaphore-based concurrency control with staggered starts
-  let activeCount = 0
-  let nextIndex = 0
-  const allDone = new Promise<void>(resolve => {
-    const tryStartNext = () => {
-      while (activeCount < concurrency && nextIndex < urls.length) {
-        const idx = nextIndex++
-        activeCount++
-        // Stagger start: add delay based on position within the concurrent batch
-        const staggerDelay = (activeCount - 1) * staggerDelayMs
-        setTimeout(() => {
-          processUrl(urls[idx], idx).finally(() => {
-            activeCount--
-            if (completed + failed === urls.length) {
-              resolve()
-            } else {
-              tryStartNext()
-            }
-          })
-        }, staggerDelay)
-      }
-    }
-    tryStartNext()
-  })
-
-  // Periodic progress update while processing
-  const progressInterval = setInterval(() => {
-    updateProgress()
-  }, 5000)
-
-  await allDone
-  clearInterval(progressInterval)
-
-  // Final update with summary
-  const totalElapsed = (Date.now() - startTime) / 1000
-
-  let finalText = `<b>✅ Batch Upload Complete!</b>\n\n`
-  finalText += `📊 ${completed}/${urls.length} successful${failed > 0 ? ` | ❌ ${failed} failed` : ''}\n`
-  finalText += `⏱ Total time: <code>${secToTime(Math.round(totalElapsed))}</code>\n`
-
-  // Only show failed URLs
-  if (failedUrls.length > 0) {
-    const failedList = failedUrls
-      .sort((a, b) => a.index - b.index)
-      .map(f => `${f.index + 1}. <code>${f.url}</code>\n   ⚠️ ${f.error}`)
-      .join('\n')
-    finalText += `\n<b>❌ Failed:</b>\n${failedList}`
-  }
-
-  await bot
-    .editMessage(chat, {
-      message: statusMsg.id,
-      text: finalText,
-      parseMode: 'html',
-      linkPreview: false,
-    })
-    .catch(() => {})
-
-  log(`Batch upload for chat ${chat}: ${completed} success, ${failed} failed, ${urls.length} total in ${Math.round(totalElapsed)}s`)
 }
 
 async function transferSingleURL(
@@ -598,9 +851,9 @@ async function transferSingleURL(
           headers: {
             'User-Agent':
               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'image/*,video/*,*/*',
+            Accept: 'image/*,video/*,*/*',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
+            Connection: 'keep-alive',
           },
           signal: controller.signal,
         })
@@ -610,20 +863,25 @@ async function transferSingleURL(
           if (response.status === 503 || response.status === 429 || response.status === 408) {
             // Rate limited, service unavailable, or timeout — retry with exponential backoff
             const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000) // 2s, 4s, 8s, 16s, 30s
-            log(`[${current}/${total}] HTTP ${response.status} for ${url}, retry ${attempt}/${maxRetries} after ${delay}ms`)
+            log(
+              `[${current}/${total}] HTTP ${response.status} for ${url}, retry ${attempt}/${maxRetries} after ${delay}ms`,
+            )
             if (attempt < maxRetries) {
               await new Promise(resolve => setTimeout(resolve, delay))
               continue
             }
           }
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+          lastError = new Error(`HTTP ${response.status}: ${response.statusText}`)
+          throw lastError
         }
         break // success
       } catch (e) {
         lastError = e
         if (attempt < maxRetries) {
           const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000)
-          log(`[${current}/${total}] Fetch error for ${url}: ${e.message}, retry ${attempt}/${maxRetries} after ${delay}ms`)
+          log(
+            `[${current}/${total}] Fetch error for ${url}: ${e.message}, retry ${attempt}/${maxRetries} after ${delay}ms`,
+          )
           await new Promise(resolve => setTimeout(resolve, delay))
         } else {
           throw lastError
@@ -644,7 +902,20 @@ async function transferSingleURL(
         log(`[${current}/${total}] File too big: ${url} (${fileSize} bytes)`)
         // Log to channel even for oversized files
         if (LOG_CHANNEL_ID) {
-          await sendFailedToLogChannel(chat, current, url, service, `File too big (${(fileSize / 1000000).toFixed(2)} MB)`)
+          let resolveLogPromise: () => void
+          const logPromise = new Promise<void>(resolve => {
+            resolveLogPromise = resolve
+          })
+          await sendToLogChannel(chat, {
+            index: current,
+            url,
+            service,
+            result: null, // No result URL as it failed
+            filePath: '', // No file path as it wasn't fully downloaded/processed
+            imageMsg: msg,
+            resolve: resolveLogPromise!,
+          })
+          await logPromise
         }
         return null
       }
@@ -707,7 +978,20 @@ async function transferSingleURL(
     ) {
       log(`[${current}/${total}] Final file too big: ${filePath} (${finalFileSize} bytes)`)
       if (LOG_CHANNEL_ID) {
-        await sendFailedToLogChannel(chat, current, url, service, `File too big (${(finalFileSize / 1000000).toFixed(2)} MB)`)
+        let resolveLogPromise: () => void
+        const logPromise = new Promise<void>(resolve => {
+          resolveLogPromise = resolve
+        })
+        await sendToLogChannel(chat, {
+          index: current,
+          url,
+          service,
+          result: null,
+          filePath,
+          imageMsg: msg,
+          resolve: resolveLogPromise!,
+        })
+        await logPromise
       }
       return null
     }
@@ -717,7 +1001,9 @@ async function transferSingleURL(
     let isCached = false
 
     if (cachedCatboxUrl) {
-      log(`[${current}/${total}] URL already uploaded, skipping Catbox: ${url} -> ${cachedCatboxUrl}`)
+      log(
+        `[${current}/${total}] URL already uploaded, skipping Catbox: ${url} -> ${cachedCatboxUrl}`,
+      )
       result = cachedCatboxUrl
       isCached = true
     } else {
@@ -732,7 +1018,8 @@ async function transferSingleURL(
         await bot
           .editMessage(chat, {
             message: statusMsgId,
-            text: `<b>📥 Batch Upload</b>\n\n` +
+            text:
+              `<b>📥 Batch Upload</b>\n\n` +
               `<b>📤 Uploading ${current}/${total} to ${service}${dots}</b>\n` +
               `📁 Size: ${(finalFileSize / 1000 / 1000).toFixed(2)} MB\n` +
               `<code>[${bar}]</code>`,
@@ -780,15 +1067,26 @@ async function transferSingleURL(
     // Save to cache for deduplication
     if (!isCached) setCachedUrl(url, result)
 
-    // Queue log channel message to maintain order
-    if (LOG_CHANNEL_ID) {
+    // Add to log channel queue to be sent sequentially
+    // Use the downloaded file (even if from cache) so the filename matches perfectly
+    try {
+      let resolveLogPromise: () => void
+      const logPromise = new Promise<void>(resolve => {
+        resolveLogPromise = resolve
+      })
+
       await sendToLogChannel(chat, {
         index: current,
-        filePath,
-        url,
+        url, // The unique url is used to ensure no duplicates in the log queue
         service,
         result,
+        filePath,
+        imageMsg: msg,
+        resolve: resolveLogPromise!,
       })
+      await logPromise // Wait for this specific log item to be processed
+    } catch (logError) {
+      log(`[${current}/${total}] Log channel error (non-fatal): ${logError.message}`)
     }
 
     // Clean up file after sending to log
@@ -796,27 +1094,37 @@ async function transferSingleURL(
       fs.rmSync(filePath)
       const dir = filePath.substring(0, filePath.lastIndexOf('/'))
       if (dir && dir !== './cache' && fs.existsSync(dir)) {
-        try { fs.rmdirSync(dir) } catch (_) {}
+        try {
+          fs.rmdirSync(dir)
+        } catch (_) {}
       }
     }
 
     return resultLine
   } catch (e) {
-    log(`[${current}/${total}] Download from URL ${url} failed: ${e.stack}`)
+    log(`[${current}/${total}] Download from URL ${url} failed: ${e.stack || e.message}`)
 
     // Log failed downloads to the log channel too
     if (LOG_CHANNEL_ID) {
-      await sendFailedToLogChannel(chat, current, url, service, e.message || 'Unknown error')
+      try {
+        await sendFailedToLogChannel(chat, current, url, service, e.message || 'Unknown error')
+      } catch (logError) {
+        log(`[${current}/${total}] Failed to send error log (non-fatal): ${logError.message}`)
+      }
     }
 
     throw e
   } finally {
     // Clean up file on error
     if (filePath && fs.existsSync(filePath)) {
-      try { fs.rmSync(filePath) } catch (_) {}
+      try {
+        fs.rmSync(filePath)
+      } catch (_) {}
       const dir = filePath.substring(0, filePath.lastIndexOf('/'))
       if (dir && dir !== './cache' && fs.existsSync(dir)) {
-        try { fs.rmdirSync(dir) } catch (_) {}
+        try {
+          fs.rmdirSync(dir)
+        } catch (_) {}
       }
     }
     chatData[chat].downloading--
@@ -825,7 +1133,13 @@ async function transferSingleURL(
 }
 
 // Send failed download info to log channel
-async function sendFailedToLogChannel(chat: number, index: number, url: string, service: string, error: string) {
+async function sendFailedToLogChannel(
+  chat: number,
+  index: number,
+  url: string,
+  service: string,
+  error: string,
+) {
   if (!LOG_CHANNEL_ID) return
   try {
     await bot
