@@ -644,8 +644,20 @@ export async function transferFromURL(msg: Api.Message) {
 
   if (urls.length === 0) return
 
-  // Implement per-chat batch queueing
-  if (chatBatchLocks.has(chat)) {
+  // Implement per-chat batch queueing using tail-promise chaining.
+  // Important: register this batch in the chain BEFORE awaiting the previous one,
+  // otherwise near-simultaneous messages can still race and start together.
+  const hadPreviousBatch = chatBatchLocks.has(chat)
+  const previousBatch = chatBatchLocks.get(chat) || Promise.resolve()
+
+  let resolveBatchParam!: () => void
+  const currentBatchPromise = new Promise<void>(resolve => {
+    resolveBatchParam = resolve
+  })
+  const batchChainPromise = previousBatch.then(() => currentBatchPromise)
+  chatBatchLocks.set(chat, batchChainPromise)
+
+  if (hadPreviousBatch) {
     const queueMsg = await bot
       .sendMessage(chat, {
         message: `⏳ <b>Task Queued!</b>\nYour batch of ${urls.length} links is waiting for your previous batch to finish...`,
@@ -655,17 +667,13 @@ export async function transferFromURL(msg: Api.Message) {
       .catch(() => null)
 
     try {
-      await chatBatchLocks.get(chat)
+      await previousBatch
     } finally {
       if (queueMsg) bot.deleteMessages(chat, [queueMsg.id], { revoke: true }).catch(() => null)
     }
+  } else {
+    await previousBatch
   }
-
-  let resolveBatchParam!: () => void
-  const currentBatchPromise = new Promise<void>(resolve => {
-    resolveBatchParam = resolve
-  })
-  chatBatchLocks.set(chat, currentBatchPromise)
 
   try {
     const startTime = Date.now()
@@ -811,7 +819,7 @@ export async function transferFromURL(msg: Api.Message) {
     )
   } finally {
     resolveBatchParam()
-    if (chatBatchLocks.get(chat) === currentBatchPromise) {
+    if (chatBatchLocks.get(chat) === batchChainPromise) {
       chatBatchLocks.delete(chat)
     }
   }
