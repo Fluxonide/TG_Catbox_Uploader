@@ -644,60 +644,75 @@ export async function transferFromURL(msg: Api.Message) {
 
   if (urls.length === 0) return
 
-  // Implement per-chat batch queueing (atomic promise chaining to avoid races)
-  const previousBatch = chatBatchLocks.get(chat) || Promise.resolve()
-  const hadPreviousBatch = chatBatchLocks.has(chat)
+  // CRITICAL: Wait for previous batch to COMPLETELY finish before starting
+  const previousBatch = chatBatchLocks.get(chat)
 
-  if (hadPreviousBatch) {
+  if (previousBatch) {
     const queueMsg = await bot
       .sendMessage(chat, {
-        message: `⏳ <b>Task Queued!</b>\nYour batch of ${urls.length} links is waiting for your previous batch to finish...`,
+        message: `⏳ <b>Batch ${urls.length} URLs Queued!</b>\n\nWaiting for previous batch to complete...`,
         replyTo: msg.id,
         parseMode: 'html',
       })
       .catch(() => null)
 
+    log(`[Batch] Chat ${chat}: Waiting for previous batch to finish...`)
+
     try {
-      await previousBatch
-    } finally {
-      if (queueMsg) bot.deleteMessages(chat, [queueMsg.id], { revoke: true }).catch(() => null)
+      await previousBatch // BLOCK until previous batch is 100% done
+      log(`[Batch] Chat ${chat}: Previous batch finished, starting new batch`)
+    } catch (e) {
+      log(`[Batch] Previous batch error: ${e.message}`)
     }
-  } else {
-    await previousBatch
+
+    if (queueMsg) {
+      await bot.deleteMessages(chat, [queueMsg.id], { revoke: true }).catch(() => null)
+    }
   }
 
-  let resolveBatchParam!: () => void
-  const currentBatchPromise = new Promise<void>(resolve => {
-    resolveBatchParam = resolve
+  // Create promise for THIS batch
+  let resolveBatch!: () => void
+  let rejectBatch!: (err: Error) => void
+  const thisBatchPromise = new Promise<void>((resolve, reject) => {
+    resolveBatch = resolve
+    rejectBatch = reject
   })
-  const batchChainPromise = previousBatch.then(() => currentBatchPromise)
-  chatBatchLocks.set(chat, batchChainPromise)
+
+  // Set lock BEFORE starting work
+  chatBatchLocks.set(chat, thisBatchPromise)
+  log(`[Batch] Chat ${chat}: Starting batch of ${urls.length} URLs`)
 
   try {
     const startTime = Date.now()
+    const batchStartIndex = msg.id // Use message ID as base index for log ordering
 
-    // Send initial message
+    // Ensure bot is connected
+    if (!bot.connected) {
+      log(`[Batch] Bot disconnected, reconnecting...`)
+      await bot.connect()
+    }
+
+    // Send initial status message
     const statusMsg = await bot.sendMessage(chat, {
-      message: `<b>📥 Batch Upload</b>\n\n0/${urls.length} completed\n<code>[${buildProgressBar(0)}]</code> 0%\n⏱ ETA: calculating...`,
+      message: `<b>📥 Batch Upload Started</b>\n\n0/${urls.length} completed\n<code>[${buildProgressBar(0)}]</code> 0%\n⏱ ETA: calculating...`,
       replyTo: msg.id,
       parseMode: 'html',
     })
 
     let completed = 0
     let failed = 0
-    const results: Array<{ index: number; result: string | null }> = []
     const failedUrls: Array<{ index: number; url: string; error: string }> = []
     let lastUpdateTime = 0
 
-    // Concurrency limit: process up to N URLs at once, but stagger start times
+    // Concurrency control
     const concurrency =
-      chat === ADMIN_ID ? Math.min(MAX_DOWNLOADING, 4) : Math.min(MAX_DOWNLOADING, 3)
-    const staggerDelayMs = 1500 // delay between starting each concurrent download
+      chat === ADMIN_ID ? Math.min(MAX_DOWNLOADING, 3) : Math.min(MAX_DOWNLOADING, 2)
+    const staggerDelayMs = 2000 // 2 seconds between starting each download
 
-    // Update progress message helper
+    // Update progress helper
     const updateProgress = async (force = false) => {
       const now = Date.now()
-      if (!force && now - lastUpdateTime < 3000) return
+      if (!force && now - lastUpdateTime < 4000) return
       lastUpdateTime = now
 
       const totalProcessed = completed + failed
@@ -706,7 +721,6 @@ export async function transferFromURL(msg: Api.Message) {
       const avgTimePerUrl = totalProcessed > 0 ? elapsed / totalProcessed : 0
       const remaining = urls.length - totalProcessed
       const eta = totalProcessed > 0 ? Math.round(avgTimePerUrl * remaining) : 0
-
       const activeCount = Math.min(concurrency, urls.length - totalProcessed)
 
       let text = `<b>📥 Batch Upload</b>\n\n`
@@ -714,12 +728,14 @@ export async function transferFromURL(msg: Api.Message) {
       text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
       text += `⏱ ETA: <code>${secToTime(eta)}</code> | ⚡ ${activeCount} active`
 
-      if (failedUrls.length > 0) {
+      if (failedUrls.length > 0 && failedUrls.length <= 5) {
         const failedList = failedUrls
-          .sort((a, b) => a.index - b.index)
-          .map(f => `${f.index + 1}. <code>${f.url}</code>\n   ⚠️ ${f.error}`)
+          .slice(0, 5)
+          .map(f => `${f.index + 1}. ${f.error}`)
           .join('\n')
         text += `\n\n<b>❌ Failed:</b>\n${failedList}`
+      } else if (failedUrls.length > 5) {
+        text += `\n\n<b>❌ ${failedUrls.length} failed</b>`
       }
 
       await bot
@@ -732,38 +748,46 @@ export async function transferFromURL(msg: Api.Message) {
         .catch(() => {})
     }
 
-    // Process with controlled concurrency using a semaphore pattern
+    // Process single URL
     const processUrl = async (url: string, urlIndex: number) => {
       try {
-        const result = await transferSingleURL(msg, url, urlIndex + 1, urls.length, statusMsg.id)
+        log(`[Batch] [${urlIndex + 1}/${urls.length}] Starting: ${url}`)
+        const result = await transferSingleURL(
+          msg,
+          url,
+          batchStartIndex + urlIndex, // Sequential index for log ordering
+          urls.length,
+          statusMsg.id,
+        )
         if (result) {
           completed++
-          results.push({ index: urlIndex, result })
+          log(`[Batch] [${urlIndex + 1}/${urls.length}] Success`)
         } else {
           failed++
-          failedUrls.push({
-            index: urlIndex,
-            url,
-            error: 'Failed to process (file too big or empty)',
-          })
+          failedUrls.push({ index: urlIndex, url, error: 'File too big or empty' })
+          log(`[Batch] [${urlIndex + 1}/${urls.length}] Failed: too big`)
         }
       } catch (error) {
         failed++
-        failedUrls.push({ index: urlIndex, url, error: error.message || 'Unknown error' })
+        const errMsg = error.message || 'Unknown error'
+        failedUrls.push({ index: urlIndex, url, error: errMsg })
+        log(`[Batch] [${urlIndex + 1}/${urls.length}] Error: ${errMsg}`)
       }
       await updateProgress()
     }
 
-    // Semaphore-based concurrency control with staggered starts
+    // Semaphore-based concurrency with staggered starts
     let activeCount = 0
     let nextIndex = 0
-    const allDone = new Promise<void>(resolve => {
+
+    await new Promise<void>(resolve => {
       const tryStartNext = () => {
         while (activeCount < concurrency && nextIndex < urls.length) {
           const idx = nextIndex++
           activeCount++
-          // Stagger start: add delay based on position within the concurrent batch
+
           const staggerDelay = (activeCount - 1) * staggerDelayMs
+
           setTimeout(() => {
             processUrl(urls[idx], idx).finally(() => {
               activeCount--
@@ -779,28 +803,34 @@ export async function transferFromURL(msg: Api.Message) {
       tryStartNext()
     })
 
-    // Periodic progress update while processing
-    const progressInterval = setInterval(() => {
-      updateProgress()
-    }, 5000)
-
-    await allDone
-    clearInterval(progressInterval)
-
-    // Final update with summary
+    // All downloads complete
     const totalElapsed = (Date.now() - startTime) / 1000
 
-    let finalText = `<b>✅ Batch Upload Complete!</b>\n\n`
-    finalText += `📊 ${completed}/${urls.length} successful${failed > 0 ? ` | ❌ ${failed} failed` : ''}\n`
-    finalText += `⏱ Total time: <code>${secToTime(Math.round(totalElapsed))}</code>\n`
+    log(
+      `[Batch] Chat ${chat}: Batch complete - ${completed} success, ${failed} failed in ${Math.round(totalElapsed)}s`,
+    )
 
-    // Only show failed URLs
+    // Final status message
+    let finalText = `<b>✅ Batch Complete!</b>\n\n`
+    finalText += `📊 ${completed}/${urls.length} successful`
+    if (failed > 0) finalText += ` | ❌ ${failed} failed`
+    finalText += `\n⏱ Total time: <code>${secToTime(Math.round(totalElapsed))}</code>`
+
     if (failedUrls.length > 0) {
       const failedList = failedUrls
-        .sort((a, b) => a.index - b.index)
-        .map(f => `${f.index + 1}. <code>${f.url}</code>\n   ⚠️ ${f.error}`)
+        .slice(0, 10)
+        .map(f => `${f.index + 1}. ${f.error}`)
         .join('\n')
-      finalText += `\n<b>❌ Failed:</b>\n${failedList}`
+      finalText += `\n\n<b>❌ Failed:</b>\n${failedList}`
+      if (failedUrls.length > 10) {
+        finalText += `\n... and ${failedUrls.length - 10} more`
+      }
+    }
+
+    // Ensure connected before final message
+    if (!bot.connected) {
+      log(`[Batch] Reconnecting for final message...`)
+      await bot.connect()
     }
 
     await bot
@@ -810,15 +840,29 @@ export async function transferFromURL(msg: Api.Message) {
         parseMode: 'html',
         linkPreview: false,
       })
-      .catch(() => {})
+      .catch(async e => {
+        log(`[Batch] Failed to edit final message: ${e.message}`)
+        await bot
+          .sendMessage(chat, {
+            message: finalText,
+            replyTo: msg.id,
+            parseMode: 'html',
+            linkPreview: false,
+          })
+          .catch(() => {})
+      })
 
-    log(
-      `Batch upload for chat ${chat}: ${completed} success, ${failed} failed, ${urls.length} total in ${Math.round(totalElapsed)}s`,
-    )
+    // Mark batch as complete
+    resolveBatch()
+  } catch (error) {
+    log(`[Batch] Chat ${chat}: Batch failed with error: ${error.message}`)
+    rejectBatch(error)
+    throw error
   } finally {
-    resolveBatchParam()
-    if (chatBatchLocks.get(chat) === batchChainPromise) {
+    // Clean up lock only if it's still ours
+    if (chatBatchLocks.get(chat) === thisBatchPromise) {
       chatBatchLocks.delete(chat)
+      log(`[Batch] Chat ${chat}: Lock released`)
     }
   }
 }
@@ -826,8 +870,8 @@ export async function transferFromURL(msg: Api.Message) {
 async function transferSingleURL(
   msg: Api.Message,
   url: string,
-  current: number,
-  total: number,
+  logIndex: number, // Sequential index for log ordering across batches
+  totalInBatch: number,
   statusMsgId: number,
 ): Promise<string | null> {
   if (msg.peerId.className !== 'PeerUser') return null
@@ -847,6 +891,12 @@ async function transferSingleURL(
     let response!: Response
     const maxRetries = 5
     let lastError: Error | null = null
+
+    // Ensure bot is connected before starting
+    if (!bot.connected) {
+      log(`[${logIndex}] Bot disconnected, reconnecting...`)
+      await bot.connect()
+    }
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -870,7 +920,7 @@ async function transferSingleURL(
             // Rate limited, service unavailable, or timeout — retry with exponential backoff
             const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000) // 2s, 4s, 8s, 16s, 30s
             log(
-              `[${current}/${total}] HTTP ${response.status} for ${url}, retry ${attempt}/${maxRetries} after ${delay}ms`,
+              `[${logIndex}] HTTP ${response.status} for ${url}, retry ${attempt}/${maxRetries} after ${delay}ms`,
             )
             if (attempt < maxRetries) {
               await new Promise(resolve => setTimeout(resolve, delay))
@@ -882,11 +932,11 @@ async function transferSingleURL(
         }
         break // success
       } catch (e) {
-        lastError = e
+        lastError = e instanceof Error ? e : new Error(String(e))
         if (attempt < maxRetries) {
           const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000)
           log(
-            `[${current}/${total}] Fetch error for ${url}: ${e.message}, retry ${attempt}/${maxRetries} after ${delay}ms`,
+            `[${logIndex}] Fetch error for ${url}: ${lastError.message}, retry ${attempt}/${maxRetries} after ${delay}ms`,
           )
           await new Promise(resolve => setTimeout(resolve, delay))
         } else {
@@ -905,23 +955,27 @@ async function transferSingleURL(
         (service === 'Catbox' && fileSize > 200000000) ||
         (service === 'Litterbox' && fileSize > 1000000000)
       ) {
-        log(`[${current}/${total}] File too big: ${url} (${fileSize} bytes)`)
+        log(`[${logIndex}] File too big: ${url} (${fileSize} bytes)`)
         // Log to channel even for oversized files
         if (LOG_CHANNEL_ID) {
-          let resolveLogPromise: () => void
-          const logPromise = new Promise<void>(resolve => {
-            resolveLogPromise = resolve
-          })
-          await sendToLogChannel(chat, {
-            index: current,
-            url,
-            service,
-            result: null, // No result URL as it failed
-            filePath: '', // No file path as it wasn't fully downloaded/processed
-            imageMsg: msg,
-            resolve: resolveLogPromise!,
-          })
-          await logPromise
+          try {
+            let resolveLogPromise: () => void
+            const logPromise = new Promise<void>(resolve => {
+              resolveLogPromise = resolve
+            })
+            await sendToLogChannel(chat, {
+              index: logIndex,
+              url,
+              service,
+              result: null,
+              filePath: '',
+              imageMsg: msg,
+              resolve: resolveLogPromise!,
+            })
+            await logPromise
+          } catch (e) {
+            log(`[${logIndex}] Log error (non-fatal): ${e.message}`)
+          }
         }
         return null
       }
@@ -952,7 +1006,7 @@ async function transferSingleURL(
     fs.mkdirSync(uniqueDir, { recursive: true })
     filePath = `${uniqueDir}/${originalName}`
 
-    log(`[${current}/${total}] Start downloading from URL: ${url} to ${filePath}...`)
+    log(`[${logIndex}] Start downloading from URL: ${url} to ${filePath}...`)
 
     // Download file with streaming
     const reader = response.body?.getReader()
@@ -975,29 +1029,33 @@ async function transferSingleURL(
     })
 
     const finalFileSize = fs.statSync(filePath).size
-    log(`[${current}/${total}] Downloaded from URL: ${filePath} (Size ${finalFileSize})`)
+    log(`[${logIndex}] Downloaded from URL: ${filePath} (Size ${finalFileSize})`)
 
     // Check final file size
     if (
       (service === 'Catbox' && finalFileSize > 200000000) ||
       (service === 'Litterbox' && finalFileSize > 1000000000)
     ) {
-      log(`[${current}/${total}] Final file too big: ${filePath} (${finalFileSize} bytes)`)
+      log(`[${logIndex}] Final file too big: ${filePath} (${finalFileSize} bytes)`)
       if (LOG_CHANNEL_ID) {
-        let resolveLogPromise: () => void
-        const logPromise = new Promise<void>(resolve => {
-          resolveLogPromise = resolve
-        })
-        await sendToLogChannel(chat, {
-          index: current,
-          url,
-          service,
-          result: null,
-          filePath,
-          imageMsg: msg,
-          resolve: resolveLogPromise!,
-        })
-        await logPromise
+        try {
+          let resolveLogPromise: () => void
+          const logPromise = new Promise<void>(resolve => {
+            resolveLogPromise = resolve
+          })
+          await sendToLogChannel(chat, {
+            index: logIndex,
+            url,
+            service,
+            result: null,
+            filePath,
+            imageMsg: msg,
+            resolve: resolveLogPromise!,
+          })
+          await logPromise
+        } catch (e) {
+          log(`[${logIndex}] Log error (non-fatal): ${e.message}`)
+        }
       }
       return null
     }
@@ -1007,9 +1065,7 @@ async function transferSingleURL(
     let isCached = false
 
     if (cachedCatboxUrl) {
-      log(
-        `[${current}/${total}] URL already uploaded, skipping Catbox: ${url} -> ${cachedCatboxUrl}`,
-      )
+      log(`[${logIndex}] URL already uploaded, using cache: ${url} -> ${cachedCatboxUrl}`)
       result = cachedCatboxUrl
       isCached = true
     } else {
@@ -1026,7 +1082,7 @@ async function transferSingleURL(
             message: statusMsgId,
             text:
               `<b>📥 Batch Upload</b>\n\n` +
-              `<b>📤 Uploading ${current}/${total} to ${service}${dots}</b>\n` +
+              `<b>📤 Uploading to ${service}${dots}</b>\n` +
               `📁 Size: ${(finalFileSize / 1000 / 1000).toFixed(2)} MB\n` +
               `<code>[${bar}]</code>`,
             parseMode: 'html',
@@ -1053,7 +1109,7 @@ async function transferSingleURL(
           } catch (e) {
             uploadRetries--
             if (uploadRetries > 0) {
-              log(`[${current}/${total}] Upload failed, retrying... (${e.message})`)
+              log(`[${logIndex}] Upload failed, retrying... (${e.message})`)
               await new Promise(resolve => setTimeout(resolve, 3000))
             } else {
               throw new Error(`Upload failed after retries: ${e.message}`)
@@ -1065,34 +1121,41 @@ async function transferSingleURL(
       }
     }
 
-    const resultLine = `<code>${current}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB${isCached ? ' (Cached)' : ''}</a> (<a href="${url}">src</a>)`
+    const resultLine = `<code>${logIndex}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB${isCached ? ' (Cached)' : ''}</a>`
 
     chatData[chat].total++
-    log(`[${current}/${total}] Processed ${filePath} from URL for ${service}: ${result}`)
+    log(`[${logIndex}] Processed ${filePath} from URL for ${service}: ${result}`)
 
     // Save to cache for deduplication
     if (!isCached) setCachedUrl(url, result)
 
-    // Add to log channel queue to be sent sequentially
-    // Use the downloaded file (even if from cache) so the filename matches perfectly
-    try {
-      let resolveLogPromise: () => void
-      const logPromise = new Promise<void>(resolve => {
-        resolveLogPromise = resolve
-      })
+    // Ensure bot is connected before sending to log
+    if (LOG_CHANNEL_ID && !bot.connected) {
+      log(`[${logIndex}] Bot disconnected before log, reconnecting...`)
+      await bot.connect()
+    }
 
-      await sendToLogChannel(chat, {
-        index: current,
-        url, // The unique url is used to ensure no duplicates in the log queue
-        service,
-        result,
-        filePath,
-        imageMsg: msg,
-        resolve: resolveLogPromise!,
-      })
-      await logPromise // Wait for this specific log item to be processed
-    } catch (logError) {
-      log(`[${current}/${total}] Log channel error (non-fatal): ${logError.message}`)
+    // Add to log channel queue to be sent sequentially
+    if (LOG_CHANNEL_ID) {
+      try {
+        let resolveLogPromise: () => void
+        const logPromise = new Promise<void>(resolve => {
+          resolveLogPromise = resolve
+        })
+
+        await sendToLogChannel(chat, {
+          index: logIndex, // Use sequential index for proper ordering
+          url,
+          service,
+          result,
+          filePath,
+          imageMsg: msg,
+          resolve: resolveLogPromise!,
+        })
+        await logPromise // Wait for this specific log item to be processed
+      } catch (logError) {
+        log(`[${logIndex}] Log channel error (non-fatal): ${logError.message}`)
+      }
     }
 
     // Clean up file after sending to log
@@ -1108,14 +1171,14 @@ async function transferSingleURL(
 
     return resultLine
   } catch (e) {
-    log(`[${current}/${total}] Download from URL ${url} failed: ${e.stack || e.message}`)
+    log(`[${logIndex}] Download from URL ${url} failed: ${e.stack || e.message}`)
 
     // Log failed downloads to the log channel too
     if (LOG_CHANNEL_ID) {
       try {
-        await sendFailedToLogChannel(chat, current, url, service, e.message || 'Unknown error')
+        await sendFailedToLogChannel(chat, logIndex, url, service, e.message || 'Unknown error')
       } catch (logError) {
-        log(`[${current}/${total}] Failed to send error log (non-fatal): ${logError.message}`)
+        log(`[${logIndex}] Failed to send error log (non-fatal): ${logError.message}`)
       }
     }
 
@@ -1134,7 +1197,7 @@ async function transferSingleURL(
       }
     }
     chatData[chat].downloading--
-    log(`[${current}/${total}] Finished transferring process from URL`)
+    log(`[${logIndex}] Finished transferring process from URL`)
   }
 }
 
