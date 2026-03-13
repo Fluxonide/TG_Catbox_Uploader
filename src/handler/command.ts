@@ -3,7 +3,7 @@ import * as buttons from './buttons.js'
 import { bot, BOT_NAME } from '../../index.js'
 import { Catbox } from 'node-catbox'
 import { chatData, saveBotData } from './data.js'
-import { ADMIN_ID } from '../env.js'
+import { ADMIN_ID, LOG_CHANNEL_ID } from '../env.js'
 import type { Api } from 'telegram'
 
 // Bot command handler
@@ -18,9 +18,17 @@ export async function handleCommand(msg: Api.Message) {
   command = command.split('@')[0]
   const arg = text.split(' ').slice(1).join(' ')
   // Check if the command is valid
-  if (GeneralCommands.prototype.hasOwnProperty(command)) new GeneralCommands(msg)[command](arg)
-  else if (OwnerCommands.prototype.hasOwnProperty(command) && chat === ADMIN_ID)
-    new OwnerCommands(msg)[command](arg)
+  const generalCmds = new GeneralCommands(msg)
+  const ownerCmds = new OwnerCommands(msg)
+
+  console.log(`[Command Debug] Trying command '${command}' for chat ${chat} (ADMIN_ID: ${ADMIN_ID})`)
+  console.log(`[Command Debug] isGeneral: ${typeof (generalCmds as any)[command] === 'function'}, isOwner: ${typeof (ownerCmds as any)[command] === 'function'}`)
+
+  if (typeof (generalCmds as any)[command] === 'function') {
+    ;(generalCmds as any)[command](arg)
+  } else if (chat === ADMIN_ID && typeof (ownerCmds as any)[command] === 'function') {
+    ;(ownerCmds as any)[command](arg)
+  }
 }
 
 class OwnerCommands {
@@ -90,6 +98,26 @@ class OwnerCommands {
     }
     clearInterval(edit)
     await bot.editMessage(ADMIN_ID, { message: result.id, text: 'Broadcast success!' })
+  }
+
+  async send(text: string) {
+    if (!LOG_CHANNEL_ID) {
+      return bot.sendMessage(this.chat, { message: 'LOG_CHANNEL_ID is not configured.' }).catch(console.error)
+    }
+    if (!text) {
+      return bot.sendMessage(this.chat, { message: 'Usage: /send your text here' }).catch(console.error)
+    }
+
+    try {
+      await bot.sendMessage(LOG_CHANNEL_ID, {
+        message: `<b><i><u>${text}</u></i></b>`,
+        parseMode: 'html',
+        linkPreview: false,
+      })
+      await bot.sendMessage(this.chat, { message: 'Message sent to log channel.' })
+    } catch (e) {
+      bot.sendMessage(this.chat, { message: `Failed to send: ${e.message}` }).catch(console.error)
+    }
   }
 }
 
