@@ -10,6 +10,8 @@
 
 - [x] Upload files (stickers, photos, audios, videos)
 
+- [x] Upload files from URLs
+
 - [x] Use Catbox (max 200 MB per file) and Litterbox (max 1 GB per file) as storage
 
 - [x] Multi-language support (zh_CN & en_US currently)
