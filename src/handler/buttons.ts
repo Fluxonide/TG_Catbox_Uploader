@@ -77,4 +77,17 @@ const back = (lang: string) => {
   return [[cb(i18n.t(lang, 'settings_back'), 'back')]]
 }
 
-export { setLanguage, mainSettings, setService, setLitterBoxExpiration, back, setToken }
+// Refresh button for batch progress
+const refreshProgress = (chat: string | number) => {
+  return [[cb('🔄 Refresh Status', `refresh_${chat}`)]]
+}
+
+export {
+  setLanguage,
+  mainSettings,
+  setService,
+  setLitterBoxExpiration,
+  back,
+  setToken,
+  refreshProgress,
+}
