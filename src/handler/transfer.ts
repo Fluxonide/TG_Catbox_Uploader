@@ -17,9 +17,6 @@ import {
 } from '../env.js'
 import type { Api } from 'telegram'
 
-// Limit sharp to 1 thread to reduce memory usage on low-RAM systems
-sharp.concurrency(1)
-
 // Queue for ordered log channel messages
 interface LogQueueItem {
   index: number
@@ -312,9 +309,6 @@ async function processLogQueue(chat: number) {
 
       sentSet.add(item.url)
       log(`[Log] Marked as sent: ${item.url}`)
-
-      // Force GC after each item to free memory on low-RAM systems
-      if (typeof global.gc === 'function') global.gc()
 
       // Longer delay to avoid AUTH_KEY_DUPLICATED errors
       const delayMs = 5000 // 5 seconds between log uploads
