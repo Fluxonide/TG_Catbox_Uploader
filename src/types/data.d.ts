@@ -19,7 +19,6 @@ export interface UserData {
   downloading: number
   total: number
   service: StorageService
-  /** Litterbox Expiration */
   lbe: LitterboxExpiration
   banned: boolean
   token: string
