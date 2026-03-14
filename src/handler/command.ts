@@ -440,7 +440,6 @@ class GeneralCommands {
     })
 
     try {
-      // Download the URL list
       const urlObj = new URL(url)
       const referer = `${urlObj.protocol}//${urlObj.host}/`
 
@@ -458,15 +457,10 @@ class GeneralCommands {
         },
       })
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`)
 
       const content = await response.text()
-
-      // Extract URLs from the content
-      const urlRegex = /https?:\/\/[^\s]+/g
-      const urls = content.match(urlRegex) || []
+      const urls = content.match(/https?:\/\/[^\s]+/g) || []
 
       if (urls.length === 0) {
         await bot.editMessage(this.chat, {
@@ -478,192 +472,23 @@ class GeneralCommands {
 
       await bot.editMessage(this.chat, {
         message: statusMsg.id,
-        text: `✅ Found ${urls.length} URLs.\n\nStarting sequential download...`,
+        text: `✅ Found ${urls.length} URLs. Starting parallel download...`,
       })
 
-      // Import transfer function
-      const { transferSingleURL } = await import('./transfer.js')
+      const { runBatch } = await import('./batchProcessor.js')
+      const syntheticMsg = {
+        peerId: {
+          className: 'PeerUser',
+          userId: { toJSNumber: () => this.chat, toString: () => this.chat.toString() },
+        },
+        id: 0,
+      } as any
 
-      let completed = 0
-      let failed = 0
-      const failedUrls: Array<{ index: number; url: string; error: string }> = []
-      const startTime = Date.now()
-
-      // Helper functions
-      function secToTime(sec: number) {
-        if (!isFinite(sec) || sec < 0) return '00:00:00'
-        const hour = Math.floor(sec / 3600)
-        const min = Math.floor((sec - hour * 3600) / 60)
-        const secs = sec - hour * 3600 - min * 60
-        return [
-          hour.toString().padStart(2, '0'),
-          min.toString().padStart(2, '0'),
-          secs.toString().padStart(2, '0'),
-        ].join(':')
-      }
-
-      function buildProgressBar(percent: number, length = 20): string {
-        const clamped = Math.max(0, Math.min(100, percent))
-        const filled = Math.round((clamped / 100) * length)
-        return '█'.repeat(filled) + '░'.repeat(length - filled)
-      }
-
-      // Store progress state for refresh button
-      const progressState = {
-        completed,
-        failed,
-        failedUrls,
-        startTime,
-        totalUrls: urls.length,
-        statusMsgId: statusMsg.id,
-        chat: this.chat,
-        isComplete: false,
-        isCancelled: false,
-      }
-
-      // Store in chatData for access from callback
-      chatData[this.chat].batchProgress = progressState
-
-      // Update progress
-      const updateProgress = async (showButton = true) => {
-        const totalProcessed = progressState.completed + progressState.failed
-        const progress = Math.round((totalProcessed / progressState.totalUrls) * 100)
-        const elapsed = (Date.now() - progressState.startTime) / 1000
-        const avgTimePerUrl = totalProcessed > 0 ? elapsed / totalProcessed : 0
-        const remaining = progressState.totalUrls - totalProcessed
-        const eta = totalProcessed > 0 ? Math.round(avgTimePerUrl * remaining) : 0
-
-        let text = `<b>📥 Batch Download</b>\n\n`
-        text += `✅ ${progressState.completed} | ❌ ${progressState.failed} | 📊 ${totalProcessed}/${progressState.totalUrls}\n`
-        text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
-        text += `⏱ ETA: <code>${secToTime(eta)}</code>`
-
-        if (progressState.failedUrls.length > 0 && progressState.failedUrls.length <= 5) {
-          const failedList = progressState.failedUrls
-            .slice(0, 5)
-            .map(f => `${f.index + 1}. ${f.error}`)
-            .join('\n')
-          text += `\n\n<b>❌ Failed:</b>\n${failedList}`
-        } else if (progressState.failedUrls.length > 5) {
-          text += `\n\n<b>❌ ${progressState.failedUrls.length} failed</b>`
-        }
-
-        await bot
-          .editMessage(this.chat, {
-            message: statusMsg.id,
-            text,
-            parseMode: 'html',
-            linkPreview: false,
-            buttons:
-              showButton && !progressState.isComplete
-                ? buttons.refreshProgress(this.chat)
-                : undefined,
-          })
-          .catch(() => {})
-      }
-
-      // Auto-update progress every 5 seconds
-      const progressInterval = setInterval(() => {
-        if (!progressState.isComplete) {
-          updateProgress().catch(() => {})
-        }
-      }, 5000)
-
-      // Process URLs one by one sequentially
-      for (let i = 0; i < urls.length; i++) {
-        // Check if cancelled
-        if (progressState.isCancelled) {
-          console.log('Batch download cancelled by user')
-          break
-        }
-
-        const currentUrl = urls[i]
-
-        try {
-          console.log(`[${i + 1}/${urls.length}] Processing: ${currentUrl}`)
-
-          // Create a minimal synthetic message
-          const syntheticMsg = {
-            peerId: {
-              className: 'PeerUser',
-              userId: {
-                toJSNumber: () => this.chat,
-                toString: () => this.chat.toString(),
-              },
-            },
-            id: i + 1,
-          } as any
-
-          const result = await transferSingleURL(
-            syntheticMsg,
-            currentUrl,
-            i + 1,
-            urls.length,
-            statusMsg.id,
-          )
-
-          if (result) {
-            progressState.completed++
-          } else {
-            progressState.failed++
-            progressState.failedUrls.push({
-              index: i,
-              url: currentUrl,
-              error: 'File too big or empty',
-            })
-          }
-        } catch (error) {
-          progressState.failed++
-          progressState.failedUrls.push({
-            index: i,
-            url: currentUrl,
-            error: error.message || 'Unknown error',
-          })
-          console.error(`[${i + 1}/${urls.length}] Error: ${error.message}`)
-        }
-      }
-
-      // Stop auto-update
-      clearInterval(progressInterval)
-      progressState.isComplete = true
-
-      // Final summary
-      const totalElapsed = (Date.now() - startTime) / 1000
-      const totalProcessed = progressState.completed + progressState.failed
-
-      let finalText = progressState.isCancelled
-        ? `<b>🛑 Batch Cancelled!</b>\n\n`
-        : `<b>✅ Batch Complete!</b>\n\n`
-
-      finalText += `📊 ${progressState.completed}/${urls.length} successful`
-      if (progressState.failed > 0) finalText += ` | ❌ ${progressState.failed} failed`
-      if (progressState.isCancelled) finalText += ` | ⏭ ${urls.length - totalProcessed} skipped`
-      finalText += `\n⏱ Total time: <code>${secToTime(Math.round(totalElapsed))}</code>`
-
-      if (progressState.failedUrls.length > 0) {
-        const failedList = progressState.failedUrls
-          .slice(0, 10)
-          .map(f => `${f.index + 1}. ${f.error}`)
-          .join('\n')
-        finalText += `\n\n<b>❌ Failed:</b>\n${failedList}`
-        if (progressState.failedUrls.length > 10) {
-          finalText += `\n... and ${failedUrls.length - 10} more`
-        }
-      }
-
-      await bot.editMessage(this.chat, {
-        message: statusMsg.id,
-        text: finalText,
-        parseMode: 'html',
-        linkPreview: false,
-      })
-
-      // Clean up progress state
-      delete chatData[this.chat].batchProgress
+      await runBatch(syntheticMsg, urls, statusMsg.id)
     } catch (error) {
       await bot.editMessage(this.chat, {
         message: statusMsg.id,
-        text: `❌ Error downloading URL list: ${error.message}`,
+        text: `❌ Error: ${error.message}`,
       })
     }
   }
