@@ -37,6 +37,33 @@ export const BOT_NAME = ((await bot.getMe()) as Api.User).username!
 writeFileSync('./data/.session', bot.session.save() as unknown as string)
 log('Launched successfully.')
 
+// Simple HTTP server for health checks (Render requirement)
+if (process.env.PORT) {
+  const http = await import('http')
+  const PORT = parseInt(process.env.PORT)
+
+  const server = http.createServer((req, res) => {
+    if (req.url === '/' || req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          bot: BOT_NAME,
+          connected: bot.connected,
+          uptime: process.uptime(),
+        }),
+      )
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.end('Not Found')
+    }
+  })
+
+  server.listen(PORT, () => {
+    log(`Health check server listening on port ${PORT}`)
+  })
+}
+
 process
   .on('unhandledRejection', (reason, promise) => {
     console.error(reason, 'Unhandled Rejection at', promise)

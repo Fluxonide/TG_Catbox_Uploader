@@ -55,10 +55,41 @@ Or manually:
 
 ### Notes for Render
 
-- Deployed as a "worker" service (background process, no HTTP server needed)
+- Deployed as a "web" service with health check endpoint at `/health`
 - Free tier has 750 hours/month (enough for 24/7 operation)
-- No cold starts for worker services (always running)
+- Service will spin down after 15 minutes of inactivity on free tier
+- First request after spin-down takes ~30 seconds to wake up
 - Persistent disk not included in free tier (cache is ephemeral)
+- Use external monitoring (like Pulsetic) to prevent spin-down
+
+## Uptime Monitoring with Pulsetic
+
+To keep your Render service alive 24/7 on the free tier, use [Pulsetic](https://pulsetic.com) for uptime monitoring:
+
+### Setup Steps
+
+1. Deploy your bot to Render and copy the service URL (e.g., `https://tg-catbox-uploader.onrender.com`)
+2. Sign up for a free [Pulsetic](https://pulsetic.com) account
+3. Create a new monitor:
+   - **URL**: `https://your-service.onrender.com/health`
+   - **Check Interval**: 5 minutes (free tier allows 1-minute checks)
+   - **Method**: GET
+   - **Expected Status**: 200
+4. Save and activate the monitor
+
+### How It Works
+
+- Pulsetic pings your `/health` endpoint every 5 minutes
+- This prevents Render from spinning down your service due to inactivity
+- The health endpoint returns bot status: `{ status: 'ok', bot: 'YourBotName', connected: true, uptime: 12345 }`
+- You'll also get alerts if your bot goes down
+
+### Alternative Monitoring Services
+
+- [UptimeRobot](https://uptimerobot.com) - Free, 50 monitors, 5-minute intervals
+- [Cronitor](https://cronitor.io) - Free tier available
+- [Better Uptime](https://betteruptime.com) - Free for 10 monitors
+- [Freshping](https://www.freshworks.com/website-monitoring/) - Free, unlimited checks
 
 ## Docker Deployment
 
@@ -113,10 +144,12 @@ Follow the prompts to log in with your Telegram account. The session string will
 
 ## Health Checks
 
-The bot runs as a background worker and doesn't expose an HTTP server:
+The bot exposes a simple HTTP health check endpoint when `PORT` environment variable is set:
 
-- **Railway**: Uses process monitoring (no HTTP needed)
-- **Render**: Deployed as "worker" service (no health checks required)
+- **Endpoint**: `/health` or `/`
+- **Response**: `{ status: 'ok', bot: 'BotName', connected: true, uptime: 12345 }`
+- **Railway**: Uses process monitoring (HTTP server optional)
+- **Render**: Requires HTTP server for web services (health check at `/health`)
 
 ## Troubleshooting
 
@@ -145,7 +178,8 @@ The bot runs as a background worker and doesn't expose an HTTP server:
 | Free Tier          | $5 credit/month | 750 hrs/month | N/A    |
 | Auto-deploy        | ✅              | ✅            | Manual |
 | Persistent Storage | ✅              | ❌ (paid)     | ✅     |
-| Cold Starts        | ❌              | ❌            | ❌     |
+| Cold Starts        | ❌              | ✅ (15 min)   | ❌     |
+| Uptime Monitoring  | Optional        | Recommended   | Manual |
 | Setup Difficulty   | Easy            | Easy          | Medium |
 
 ## Recommendations

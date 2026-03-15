@@ -188,6 +188,9 @@ async function handleURLMessage(msg: any) {
       chat,
       isComplete: false,
       isCancelled: false,
+      logStartTime: null as number | null,
+      logLastDone: 0,
+      logLastTime: null as number | null,
     }
 
     // Store in chatData for access from callback
@@ -196,23 +199,49 @@ async function handleURLMessage(msg: any) {
     // Update progress
     const updateProgress = async (showButton = true) => {
       const totalProcessed = progressState.completed + progressState.failed
-      const progress = Math.round((totalProcessed / progressState.totalUrls) * 100)
+      const dlProgress = Math.round((totalProcessed / progressState.totalUrls) * 100)
       const elapsed = (Date.now() - progressState.startTime) / 1000
       const avgTimePerUrl = totalProcessed > 0 ? elapsed / totalProcessed : 0
       const remaining = progressState.totalUrls - totalProcessed
       const eta = totalProcessed > 0 ? Math.round(avgTimePerUrl * remaining) : 0
 
-      let text = `<b>📥 Batch Download</b>\n\n`
+      // Download bar
+      let text = `<b>📥 Batch Download</b>\n`
       text += `✅ ${progressState.completed} | ❌ ${progressState.failed} | 📊 ${totalProcessed}/${progressState.totalUrls}\n`
-      text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
-      
+      text += `<code>[${buildProgressBar(dlProgress)}]</code> ${dlProgress}%\n`
+      text += `⏱ ETA: <code>${secToTime(eta)}</code>`
+
+      // Log upload bar (always shown as a separate section)
       const logStatus = getLogQueueStatus(chat)
-      if (remaining === 0 && (logStatus.pending > 0 || logStatus.processing)) {
-        text += `⏱ ETA: <code>${secToTime(eta)}</code>\n`
-        text += `📤 <i>Uploading Logs: ${logStatus.pending} remaining</i>`
-      } else {
-        text += `⏱ ETA: <code>${secToTime(eta)}</code>`
+      const totalLogs = progressState.totalUrls
+      const logsDone = Math.max(0, totalLogs - logStatus.pending)
+      const logProgress = totalLogs > 0 ? Math.round((logsDone / totalLogs) * 100) : 0
+
+      // Track log start time once logs begin processing
+      if (logsDone > 0 && progressState.logStartTime === null) {
+        progressState.logStartTime = Date.now()
+        progressState.logLastDone = logsDone
+        progressState.logLastTime = Date.now()
       }
+
+      // Compute log ETA using a rolling rate (last snapshot → now)
+      let logEta = 0
+      if (progressState.logLastTime !== null && logsDone > progressState.logLastDone) {
+        const logElapsed = (Date.now() - progressState.logLastTime) / 1000
+        const logRate = (logsDone - progressState.logLastDone) / logElapsed // logs/sec
+        logEta = logRate > 0 ? Math.round(logStatus.pending / logRate) : 0
+        progressState.logLastDone = logsDone
+        progressState.logLastTime = Date.now()
+      } else if (progressState.logStartTime !== null) {
+        const logElapsed = (Date.now() - progressState.logStartTime) / 1000
+        const logRate = logsDone > 0 ? logsDone / logElapsed : 0
+        logEta = logRate > 0 ? Math.round(logStatus.pending / logRate) : 0
+      }
+
+      text += `\n\n<b>📤 Uploading Logs</b>\n`
+      text += `✅ ${logsDone} | ⏳ ${logStatus.pending} remaining\n`
+      text += `<code>[${buildProgressBar(logProgress)}]</code> ${logProgress}%\n`
+      text += `⏱ ETA: <code>${secToTime(logEta)}</code>`
 
       if (progressState.failedUrls.length > 0 && progressState.failedUrls.length <= 5) {
         const failedList = progressState.failedUrls
