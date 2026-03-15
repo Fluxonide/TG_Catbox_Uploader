@@ -1,9 +1,14 @@
 import { readdirSync, readFileSync } from 'fs'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import { log } from '../handler/data.js'
+
+// Resolve the i18n directory relative to this file, works in both src/ and dist/
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 class I18n {
   public readonly defaultLang = 'en_US'
-  public readonly languages = readdirSync('./src/i18n')
+  public readonly languages = readdirSync(__dirname)
     .filter(n => n.endsWith('.json'))
     .map(n => n.split('.')[0])
 
@@ -11,7 +16,9 @@ class I18n {
 
   async loadStrings() {
     for (const language of this.languages) {
-      this.strings[language] = JSON.parse(readFileSync(`./src/i18n/${language}.json`, 'utf-8'))
+      this.strings[language] = JSON.parse(
+        readFileSync(resolve(__dirname, `${language}.json`), 'utf-8'),
+      )
     }
     log(`Loaded ${this.languages.length} languages: ${this.languages.join(', ')}`)
   }

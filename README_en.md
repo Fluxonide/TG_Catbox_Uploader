@@ -24,6 +24,16 @@
 
 ## Deploy
 
+### One-Click Deploy
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/new)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
+For detailed deployment instructions, see [DEPLOY.md](DEPLOY.md)
+
+### Manual Deploy
+
 - Give me a star 😘
 
 - Clone this repo

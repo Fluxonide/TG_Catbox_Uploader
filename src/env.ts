@@ -17,6 +17,7 @@ export const PARALLEL_DOWNLOADS = parseInt(process.env.PARALLEL_DOWNLOADS || '')
 export const ALLOWED_USERS = process.env.ALLOWED_USERS
   ? process.env.ALLOWED_USERS.split(',').map(id => parseInt(id.trim()))
   : []
+export const MAX_CACHE_MB = parseInt(process.env.MAX_CACHE_MB || '') || 500
 
 if (!BOT_TOKEN || !API_ID || !API_HASH) {
   console.error('Please set BOT_TOKEN, API_ID and API_HASH in .env file')

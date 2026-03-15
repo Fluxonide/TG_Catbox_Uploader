@@ -1,27 +1,39 @@
-FROM node:20-alpine
+# Build stage
+FROM node:22-alpine AS builder
 
-# Install build deps for sharp (native bindings)
-RUN apk add --no-cache python3 make g++ vips-dev
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
 WORKDIR /app
 
-# Copy package files first for better layer caching
-COPY package.json ./
-COPY pnpm-lock.yaml* ./
+# Copy package files
+COPY package.json pnpm-lock.yaml ./
 
-# Install pnpm and dependencies
-RUN npm install -g pnpm && pnpm install --no-frozen-lockfile
+# Install dependencies (production + dev for build step)
+RUN pnpm install --frozen-lockfile
 
-# Copy source code
+# Copy source
 COPY . .
 
 # Build TypeScript
 RUN pnpm run build
 
-# Create persistent directories
-RUN mkdir -p data cache
+# Remove dev dependencies to keep image lean
+RUN pnpm prune --prod
 
-# data/ holds the Telegram session + bot data (mount as volume to persist)
-VOLUME ["/app/data"]
+# Runtime stage — minimal production image
+FROM node:22-alpine
 
+WORKDIR /app
+
+# Copy only production artifacts from builder
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/start.js ./
+
+# Create cache and data directories
+RUN mkdir -p ./cache ./data
+
+# Start via compiled JS
 CMD ["node", "start.js"]

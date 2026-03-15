@@ -1,0 +1,36 @@
+services:
+  - type: worker
+    name: tg-catbox-uploader
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node start.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: STRING_SESSION
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CATBOX_TOKEN
+        sync: false
+      - key: LOG_CHANNEL_ID
+        sync: false
+      - key: MAX_DOWNLOADING
+        value: 3
+      - key: DOWNLOAD_WORKERS
+        value: 4
+      - key: DOWNLOAD_DC_ID
+        value: 4
+      - key: PARALLEL_DOWNLOADS
+        value: 5
+      - key: BOT_NAME
+        value: Catbox Uploader
+    autoDeploy: true

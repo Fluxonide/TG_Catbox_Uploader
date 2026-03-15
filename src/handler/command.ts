@@ -482,7 +482,7 @@ class GeneralCommands {
       })
 
       // Import transfer function
-      const { transferSingleURL } = await import('./transfer.js')
+      const { transferSingleURL, getLogQueueStatus } = await import('./transfer.js')
 
       let completed = 0
       let failed = 0
@@ -519,6 +519,9 @@ class GeneralCommands {
         chat: this.chat,
         isComplete: false,
         isCancelled: false,
+        logStartTime: null as number | null,
+        logLastDone: 0,
+        logLastTime: null as number | null,
       }
 
       // Store in chatData for access from callback
@@ -527,16 +530,49 @@ class GeneralCommands {
       // Update progress
       const updateProgress = async (showButton = true) => {
         const totalProcessed = progressState.completed + progressState.failed
-        const progress = Math.round((totalProcessed / progressState.totalUrls) * 100)
+        const dlProgress = Math.round((totalProcessed / progressState.totalUrls) * 100)
         const elapsed = (Date.now() - progressState.startTime) / 1000
         const avgTimePerUrl = totalProcessed > 0 ? elapsed / totalProcessed : 0
         const remaining = progressState.totalUrls - totalProcessed
         const eta = totalProcessed > 0 ? Math.round(avgTimePerUrl * remaining) : 0
 
-        let text = `<b>📥 Batch Download</b>\n\n`
+        // Download bar
+        let text = `<b>📥 Batch Download</b>\n`
         text += `✅ ${progressState.completed} | ❌ ${progressState.failed} | 📊 ${totalProcessed}/${progressState.totalUrls}\n`
-        text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
+        text += `<code>[${buildProgressBar(dlProgress)}]</code> ${dlProgress}%\n`
         text += `⏱ ETA: <code>${secToTime(eta)}</code>`
+
+        // Log upload bar (always shown as a separate section)
+        const logStatus = getLogQueueStatus(this.chat)
+        const totalLogs = progressState.totalUrls
+        const logsDone = Math.max(0, totalLogs - logStatus.pending)
+        const logProgress = totalLogs > 0 ? Math.round((logsDone / totalLogs) * 100) : 0
+
+        // Track log start time once logs begin processing
+        if (logsDone > 0 && progressState.logStartTime === null) {
+          progressState.logStartTime = Date.now()
+          progressState.logLastDone = logsDone
+          progressState.logLastTime = Date.now()
+        }
+
+        // Compute log ETA using a rolling rate (last snapshot → now)
+        let logEta = 0
+        if (progressState.logLastTime !== null && logsDone > progressState.logLastDone) {
+          const logElapsed = (Date.now() - progressState.logLastTime) / 1000
+          const logRate = (logsDone - progressState.logLastDone) / logElapsed // logs/sec
+          logEta = logRate > 0 ? Math.round(logStatus.pending / logRate) : 0
+          progressState.logLastDone = logsDone
+          progressState.logLastTime = Date.now()
+        } else if (progressState.logStartTime !== null) {
+          const logElapsed = (Date.now() - progressState.logStartTime) / 1000
+          const logRate = logsDone > 0 ? logsDone / logElapsed : 0
+          logEta = logRate > 0 ? Math.round(logStatus.pending / logRate) : 0
+        }
+
+        text += `\n\n<b>📤 Uploading Logs</b>\n`
+        text += `✅ ${logsDone} | ⏳ ${logStatus.pending} remaining\n`
+        text += `<code>[${buildProgressBar(logProgress)}]</code> ${logProgress}%\n`
+        text += `⏱ ETA: <code>${secToTime(logEta)}</code>`
 
         if (progressState.failedUrls.length > 0 && progressState.failedUrls.length <= 5) {
           const failedList = progressState.failedUrls
@@ -583,9 +619,7 @@ class GeneralCommands {
           const currentUrl = urls[i]
 
           try {
-            console.log(
-              `[${i + 1}/${urls.length}] Processing: ${currentUrl}`,
-            )
+            console.log(`[${i + 1}/${urls.length}] Processing: ${currentUrl}`)
 
             const syntheticMsg = {
               peerId: {
@@ -629,7 +663,7 @@ class GeneralCommands {
           // Small delay between downloads within each worker to avoid
           // thundering herd on the source server
           if (nextIndex < urls.length && !progressState.isCancelled) {
-            await sleep(500)
+            await sleep(250)
           }
         }
       }
@@ -638,18 +672,23 @@ class GeneralCommands {
       const workers: Promise<void>[] = []
       const workerCount = Math.min(PARALLEL_DOWNLOADS, urls.length)
       for (let w = 0; w < workerCount; w++) {
-        workers.push(
-          processWorker(this.chat, urls, progressState, statusMsg.id),
-        )
+        workers.push(processWorker(this.chat, urls, progressState, statusMsg.id))
         // Stagger worker launches to avoid all workers hitting the
         // source server simultaneously at startup
         if (w < workerCount - 1) {
-          await sleep(500)
+          await sleep(250)
         }
       }
 
       // Wait for all workers to complete
       await Promise.all(workers)
+
+      // Wait for log queue to finish
+      let logStatus = getLogQueueStatus(this.chat)
+      while (!progressState.isCancelled && (logStatus.pending > 0 || logStatus.processing)) {
+        await sleep(1000)
+        logStatus = getLogQueueStatus(this.chat)
+      }
 
       // Stop auto-update
       clearInterval(progressInterval)

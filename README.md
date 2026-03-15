@@ -26,6 +26,16 @@
 
 ## 部署
 
+### 一键部署
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/new)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
+详细部署指南请查看 [DEPLOY.md](DEPLOY.md)
+
+### 本地部署
+
 - 点个 Star 😘
 
 - Clone 此仓库到本地 / 服务器

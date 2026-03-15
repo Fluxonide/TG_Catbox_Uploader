@@ -5,7 +5,6 @@ node_modules/
 *.log
 
 # Ignore environment-specific files
-.env
 
 # Ignore build output
 dist/
@@ -19,3 +18,4 @@ tg.txt
 package-lock.json
 # pnpm-lock.yaml is kept for reproducible Docker builds
 .kiro
+.env

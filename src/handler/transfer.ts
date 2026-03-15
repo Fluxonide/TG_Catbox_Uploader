@@ -3,6 +3,9 @@ import i18n from '../i18n/index.js'
 import mime from 'mime-types'
 import bigInt from 'big-integer'
 import sharp from 'sharp'
+
+// Disable sharp's internal cache to prevent memory buildup during batch processing
+sharp.cache(false)
 import { chatData, log } from './data.js'
 import { bot, BOT_NAME } from '../../index.js'
 import { Catbox, Litterbox } from 'node-catbox'
@@ -14,6 +17,7 @@ import {
   LOG_CHANNEL_ID,
   DOWNLOAD_DC_ID,
   DOWNLOAD_WORKERS,
+  MAX_CACHE_MB,
 } from '../env.js'
 import type { Api } from 'telegram'
 
@@ -34,40 +38,64 @@ const logQueue: Map<number, LogQueueItem[]> = new Map()
 const logProcessing: Map<number, boolean> = new Map()
 const logSentIndices: Map<number, Set<string>> = new Map()
 
+export function getLogQueueStatus(chat: number): { pending: number; processing: boolean } {
+  const pending = logQueue.get(chat)?.length || 0
+  const processing = logProcessing.get(chat) || false
+  return { pending, processing }
+}
+
 // Create a compressed preview for large images
-async function createCompressedPreview(filePath: string, maxSize = 2560): Promise<string | null> {
+async function createCompressedPreview(filePath: string, maxSize = 1280): Promise<string | null> {
   try {
     const previewPath = filePath.replace(/\.(jpg|jpeg|png|webp)$/i, '_preview.jpg')
 
+    // First attempt: 1280px, Quality 65, sRGB
     await sharp(filePath)
       .resize(maxSize, maxSize, {
         fit: 'inside',
         withoutEnlargement: true,
       })
+      .withMetadata({ density: 72 }) // keep basic metadata
+      .toColorspace('srgb') // enforce sRGB color profile
       .jpeg({
-        quality: 80,
+        quality: 65,
         progressive: false,
+        mozjpeg: true, // Use mozjpeg for better compression
       })
       .toFile(previewPath)
 
-    const previewSize = fs.statSync(previewPath).size
+    let previewSize = fs.statSync(previewPath).size
 
-    // If preview is still > 5MB, reduce quality further
-    if (previewSize > 5000000) {
+    // If preview is still > 1MB (1048576 bytes), forcibly reduce quality and resolution
+    // The user requested 300KB - 1MB
+    let currentQuality = 65
+    let currentSize = maxSize
+
+    while (previewSize > 1000000 && currentQuality > 20) {
+      currentQuality -= 15
+      currentSize = Math.floor(currentSize * 0.8) // Reduce resolution slightly too
+
+      log(
+        `[Log] Preview size ${(previewSize / 1000 / 1000).toFixed(2)} MB is > 1MB. Retrying with size ${currentSize}px, quality ${currentQuality}...`,
+      )
+
       await sharp(filePath)
-        .resize(maxSize, maxSize, {
+        .resize(currentSize, currentSize, {
           fit: 'inside',
           withoutEnlargement: true,
         })
+        .toColorspace('srgb')
         .jpeg({
-          quality: 75,
+          quality: currentQuality,
           progressive: false,
+          mozjpeg: true,
         })
         .toFile(previewPath)
+
+      previewSize = fs.statSync(previewPath).size
     }
 
-    const finalSize = fs.statSync(previewPath).size
-    log(`[Log] Created preview: ${(finalSize / 1000 / 1000).toFixed(2)} MB`)
+    log(`[Log] Created preview: ${(previewSize / 1000 / 1000).toFixed(2)} MB`)
 
     return previewPath
   } catch (e) {
@@ -124,6 +152,29 @@ async function processLogQueue(chat: number) {
   log(`[Log] Processing queue for chat ${chat}, queue length: ${queue.length}`)
 
   while (queue.length > 0) {
+    // Check if batch was cancelled
+    const progressState = chatData[chat]?.batchProgress
+    if (progressState?.isCancelled) {
+      log(`[Log] Batch cancelled, stopping log queue for chat ${chat}`)
+      // Resolve all remaining items and clear queue
+      while (queue.length > 0) {
+        const item = queue.shift()!
+        item.resolve()
+        // Clean up files
+        if (item.cleanupFilePath && fs.existsSync(item.cleanupFilePath)) {
+          try {
+            fs.rmSync(item.cleanupFilePath)
+          } catch (_) {}
+          if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
+            try {
+              fs.rmdirSync(item.cleanupDir)
+            } catch (_) {}
+          }
+        }
+      }
+      break
+    }
+
     // Sort queue by index to maintain order
     queue.sort((a, b) => a.index - b.index)
 
@@ -225,9 +276,9 @@ async function processLogQueue(chat: number) {
 
             // If compressed photo failed, create smaller preview and retry
             if (!imageMsg && previewPath) {
-              log(`[Log] Creating smaller preview (1920px)...`)
+              log(`[Log] Creating smaller preview (1024px)...`)
               if (fs.existsSync(previewPath)) fs.rmSync(previewPath)
-              previewPath = await createCompressedPreview(item.filePath, 1920)
+              previewPath = await createCompressedPreview(item.filePath, 1024)
 
               if (previewPath) {
                 imageMsg = (await Promise.race([
@@ -312,8 +363,8 @@ async function processLogQueue(chat: number) {
       sentSet.add(item.url)
       log(`[Log] Marked as sent: ${item.url}`)
 
-      // Longer delay to avoid AUTH_KEY_DUPLICATED errors
-      const delayMs = 5000 // 5 seconds between log uploads
+      // Delay to avoid AUTH_KEY_DUPLICATED errors (reduced for faster processing)
+      const delayMs = 2000 // 2 seconds between log uploads
       await new Promise(resolve => setTimeout(resolve, delayMs))
     } catch (e) {
       log(`Failed to send to log channel: ${e.message || e}`)
@@ -352,6 +403,42 @@ async function processLogQueue(chat: number) {
 
   logProcessing.set(chat, false)
   log(`[Log] Queue processor stopped for chat ${chat}`)
+}
+
+// Check if cache directory usage exceeds the limit
+function getCacheSizeMB(): number {
+  if (!fs.existsSync('./cache')) return 0
+  let totalBytes = 0
+  const items = fs.readdirSync('./cache')
+  for (const item of items) {
+    const itemPath = `./cache/${item}`
+    const stat = fs.statSync(itemPath)
+    if (stat.isFile()) {
+      totalBytes += stat.size
+    } else if (stat.isDirectory()) {
+      // Sum files inside subdirectory
+      try {
+        const subItems = fs.readdirSync(itemPath)
+        for (const subItem of subItems) {
+          const subPath = `${itemPath}/${subItem}`
+          try {
+            totalBytes += fs.statSync(subPath).size
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+  }
+  return totalBytes / (1024 * 1024)
+}
+
+async function waitForCacheSpace(): Promise<void> {
+  const maxMB = MAX_CACHE_MB
+  let currentMB = getCacheSizeMB()
+  while (currentMB > maxMB) {
+    log(`[Cache] Usage ${currentMB.toFixed(0)}MB exceeds limit ${maxMB}MB, waiting...`)
+    await new Promise(resolve => setTimeout(resolve, 3000))
+    currentMB = getCacheSizeMB()
+  }
 }
 
 export async function transfer(msg: Api.Message) {
@@ -663,6 +750,9 @@ export async function transferSingleURL(
 
   if (!fs.existsSync('./cache')) fs.mkdirSync('./cache')
 
+  // Wait if cache disk usage is too high
+  await waitForCacheSpace()
+
   try {
     // Download file from URL with retry logic and exponential backoff
     let response!: Response
@@ -678,7 +768,7 @@ export async function transferSingleURL(
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 60000) // 60s timeout per request
+        const timeout = setTimeout(() => controller.abort(), 30000) // 30s timeout per request
 
         // Extract domain for Referer header
         const urlObj = new URL(url)
@@ -707,7 +797,7 @@ export async function transferSingleURL(
         if (!response.ok) {
           if (response.status === 503 || response.status === 429 || response.status === 408) {
             // Rate limited, service unavailable, or timeout — retry with exponential backoff
-            const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000) // 2s, 4s, 8s, 16s, 30s
+            const delay = Math.min(2000 * Math.pow(2, attempt - 1), 15000) // 2s, 4s, 8s, 15s
             log(
               `[${logIndex}] HTTP ${response.status} for ${url}, retry ${attempt}/${maxRetries} after ${delay}ms`,
             )
@@ -733,7 +823,7 @@ export async function transferSingleURL(
       } catch (e) {
         lastError = e instanceof Error ? e : new Error(String(e))
         if (attempt < maxRetries) {
-          const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000)
+          const delay = Math.min(2000 * Math.pow(2, attempt - 1), 15000)
           log(
             `[${logIndex}] Fetch error for ${url}: ${lastError.message}, retry ${attempt}/${maxRetries} after ${delay}ms`,
           )
@@ -909,7 +999,7 @@ export async function transferSingleURL(
             uploadRetries--
             if (uploadRetries > 0) {
               log(`[${logIndex}] Upload failed, retrying... (${e.message})`)
-              await new Promise(resolve => setTimeout(resolve, 3000))
+              await new Promise(resolve => setTimeout(resolve, 1500))
             } else {
               throw new Error(`Upload failed after retries: ${e.message}`)
             }
@@ -964,18 +1054,26 @@ export async function transferSingleURL(
         log(`[${logIndex}] Log channel error (non-fatal): ${logError.message}`)
         // Clean up file immediately if log queueing itself failed
         if (filePath && fs.existsSync(filePath)) {
-          try { fs.rmSync(filePath) } catch (_) {}
+          try {
+            fs.rmSync(filePath)
+          } catch (_) {}
           if (fileDir && fileDir !== './cache' && fs.existsSync(fileDir)) {
-            try { fs.rmdirSync(fileDir) } catch (_) {}
+            try {
+              fs.rmdirSync(fileDir)
+            } catch (_) {}
           }
         }
       }
     } else {
       // No log channel — clean up file immediately
       if (filePath && fs.existsSync(filePath)) {
-        try { fs.rmSync(filePath) } catch (_) {}
+        try {
+          fs.rmSync(filePath)
+        } catch (_) {}
         if (fileDir && fileDir !== './cache' && fs.existsSync(fileDir)) {
-          try { fs.rmdirSync(fileDir) } catch (_) {}
+          try {
+            fs.rmdirSync(fileDir)
+          } catch (_) {}
         }
       }
     }

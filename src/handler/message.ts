@@ -151,7 +151,7 @@ async function handleURLMessage(msg: any) {
 
   try {
     // Import transfer function
-    const { transferSingleURL } = await import('./transfer.js')
+    const { transferSingleURL, getLogQueueStatus } = await import('./transfer.js')
 
     let completed = 0
     let failed = 0
@@ -205,7 +205,14 @@ async function handleURLMessage(msg: any) {
       let text = `<b>📥 Batch Download</b>\n\n`
       text += `✅ ${progressState.completed} | ❌ ${progressState.failed} | 📊 ${totalProcessed}/${progressState.totalUrls}\n`
       text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
-      text += `⏱ ETA: <code>${secToTime(eta)}</code>`
+      
+      const logStatus = getLogQueueStatus(chat)
+      if (remaining === 0 && (logStatus.pending > 0 || logStatus.processing)) {
+        text += `⏱ ETA: <code>${secToTime(eta)}</code>\n`
+        text += `📤 <i>Uploading Logs: ${logStatus.pending} remaining</i>`
+      } else {
+        text += `⏱ ETA: <code>${secToTime(eta)}</code>`
+      }
 
       if (progressState.failedUrls.length > 0 && progressState.failedUrls.length <= 5) {
         const failedList = progressState.failedUrls
@@ -272,6 +279,13 @@ async function handleURLMessage(msg: any) {
         })
         console.error(`[${i + 1}/${urls.length}] Error: ${error.message}`)
       }
+    }
+
+    // Wait for log queue to finish
+    let logStatus = getLogQueueStatus(chat)
+    while (!progressState.isCancelled && (logStatus.pending > 0 || logStatus.processing)) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      logStatus = getLogQueueStatus(chat)
     }
 
     // Stop auto-update
