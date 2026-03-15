@@ -3,7 +3,7 @@ import * as buttons from './buttons.js'
 import { bot, BOT_NAME } from '../../index.js'
 import { Catbox } from 'node-catbox'
 import { chatData, saveBotData } from './data.js'
-import { ADMIN_ID, LOG_CHANNEL_ID } from '../env.js'
+import { ADMIN_ID, LOG_CHANNEL_ID, PARALLEL_DOWNLOADS } from '../env.js'
 import type { Api } from 'telegram'
 import * as fs from 'fs'
 import mime from 'mime-types'
@@ -478,7 +478,7 @@ class GeneralCommands {
 
       await bot.editMessage(this.chat, {
         message: statusMsg.id,
-        text: `✅ Found ${urls.length} URLs.\n\nStarting sequential download...`,
+        text: `✅ Found ${urls.length} URLs.\n\nStarting parallel download (${PARALLEL_DOWNLOADS} concurrent)...`,
       })
 
       // Import transfer function
@@ -569,59 +569,87 @@ class GeneralCommands {
         }
       }, 5000)
 
-      // Process URLs one by one sequentially
-      for (let i = 0; i < urls.length; i++) {
-        // Check if cancelled
-        if (progressState.isCancelled) {
-          console.log('Batch download cancelled by user')
-          break
-        }
+      // Process URLs with controlled concurrency (worker pool pattern)
+      let nextIndex = 0 // Shared counter for the next URL to process
 
-        const currentUrl = urls[i]
+      async function processWorker(
+        chat: number,
+        urls: string[],
+        progressState: any,
+        statusMsgId: number,
+      ): Promise<void> {
+        while (nextIndex < urls.length && !progressState.isCancelled) {
+          const i = nextIndex++
+          const currentUrl = urls[i]
 
-        try {
-          console.log(`[${i + 1}/${urls.length}] Processing: ${currentUrl}`)
+          try {
+            console.log(
+              `[${i + 1}/${urls.length}] Processing: ${currentUrl}`,
+            )
 
-          // Create a minimal synthetic message
-          const syntheticMsg = {
-            peerId: {
-              className: 'PeerUser',
-              userId: {
-                toJSNumber: () => this.chat,
-                toString: () => this.chat.toString(),
+            const syntheticMsg = {
+              peerId: {
+                className: 'PeerUser',
+                userId: {
+                  toJSNumber: () => chat,
+                  toString: () => chat.toString(),
+                },
               },
-            },
-            id: i + 1,
-          } as any
+              id: i + 1,
+            } as any
 
-          const result = await transferSingleURL(
-            syntheticMsg,
-            currentUrl,
-            i + 1,
-            urls.length,
-            statusMsg.id,
-          )
+            const result = await transferSingleURL(
+              syntheticMsg,
+              currentUrl,
+              i + 1,
+              urls.length,
+              statusMsgId,
+            )
 
-          if (result) {
-            progressState.completed++
-          } else {
+            if (result) {
+              progressState.completed++
+            } else {
+              progressState.failed++
+              progressState.failedUrls.push({
+                index: i,
+                url: currentUrl,
+                error: 'File too big or empty',
+              })
+            }
+          } catch (error) {
             progressState.failed++
             progressState.failedUrls.push({
               index: i,
               url: currentUrl,
-              error: 'File too big or empty',
+              error: error.message || 'Unknown error',
             })
+            console.error(`[${i + 1}/${urls.length}] Error: ${error.message}`)
           }
-        } catch (error) {
-          progressState.failed++
-          progressState.failedUrls.push({
-            index: i,
-            url: currentUrl,
-            error: error.message || 'Unknown error',
-          })
-          console.error(`[${i + 1}/${urls.length}] Error: ${error.message}`)
+
+          // Small delay between downloads within each worker to avoid
+          // thundering herd on the source server
+          if (nextIndex < urls.length && !progressState.isCancelled) {
+            await sleep(500)
+          }
         }
       }
+
+      // Launch N workers with staggered starts
+      const workers: Promise<void>[] = []
+      const workerCount = Math.min(PARALLEL_DOWNLOADS, urls.length)
+      for (let w = 0; w < workerCount; w++) {
+        workers.push(
+          processWorker(this.chat, urls, progressState, statusMsg.id),
+        )
+        // Stagger worker launches to avoid all workers hitting the
+        // source server simultaneously at startup
+        if (w < workerCount - 1) {
+          await sleep(500)
+        }
+      }
+
+      // Wait for all workers to complete
+      await Promise.all(workers)
 
       // Stop auto-update
       clearInterval(progressInterval)
