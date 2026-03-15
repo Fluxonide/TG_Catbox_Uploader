@@ -32,11 +32,11 @@ interface LogQueueItem {
   resolve: () => void
   cleanupFilePath?: string // File path to delete after log is sent (for parallel mode)
   cleanupDir?: string // Directory to remove after file cleanup
+  isBatch?: boolean // True if part of a batch operation (URL list), false for single file uploads
 }
 
 const logQueue: Map<number, LogQueueItem[]> = new Map()
 const logProcessing: Map<number, boolean> = new Map()
-const logSentIndices: Map<number, Set<string>> = new Map()
 
 export function getLogQueueStatus(chat: number): { pending: number; processing: boolean } {
   const pending = logQueue.get(chat)?.length || 0
@@ -112,20 +112,6 @@ async function sendToLogChannel(chat: number, item: LogQueueItem) {
 
   log(`[Log] Adding to queue: ${item.url} (index ${item.index}) for chat ${chat}`)
 
-  // Init tracking structures for this chat
-  if (!logSentIndices.has(chat)) {
-    logSentIndices.set(chat, new Set())
-  }
-
-  const sentSet = logSentIndices.get(chat)!
-
-  // Skip if already sent (dedup)
-  if (sentSet.has(item.url)) {
-    log(`[Log] Skipping duplicate URL ${item.url} for chat ${chat}`)
-    item.resolve() // Resolve immediately if already sent
-    return
-  }
-
   // Add to queue
   if (!logQueue.has(chat)) {
     logQueue.set(chat, [])
@@ -147,7 +133,6 @@ async function sendToLogChannel(chat: number, item: LogQueueItem) {
 
 async function processLogQueue(chat: number) {
   const queue = logQueue.get(chat)!
-  const sentSet = logSentIndices.get(chat)!
 
   log(`[Log] Processing queue for chat ${chat}, queue length: ${queue.length}`)
 
@@ -181,14 +166,6 @@ async function processLogQueue(chat: number) {
     const item = queue[0]
 
     log(`[Log] Processing item: ${item.url} (index ${item.index})`)
-
-    // Dedup check
-    if (sentSet.has(item.url)) {
-      log(`[Log] Already sent, skipping: ${item.url}`)
-      queue.shift()
-      item.resolve()
-      continue
-    }
 
     // Check if file still exists before processing
     if (!item.url.startsWith('tg-file-') && item.filePath && !fs.existsSync(item.filePath)) {
@@ -360,8 +337,7 @@ async function processLogQueue(chat: number) {
         }
       }
 
-      sentSet.add(item.url)
-      log(`[Log] Marked as sent: ${item.url}`)
+      log(`[Log] Successfully sent to log channel: ${item.url}`)
 
       // Delay to avoid AUTH_KEY_DUPLICATED errors (reduced for faster processing)
       const delayMs = 2000 // 2 seconds between log uploads
@@ -378,8 +354,6 @@ async function processLogQueue(chat: number) {
       } catch (_) {
         // Ignore if even text message fails
       }
-      // Mark as sent even on error to avoid infinite retries
-      sentSet.add(item.url)
     }
 
     queue.shift()
@@ -1010,7 +984,7 @@ export async function transferSingleURL(
       }
     }
 
-    const resultLine = `<code>${logIndex}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB${isCached ? ' (Cached)' : ''}</a>`
+    const resultLine = `<code>${logIndex}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB</a>`
 
     chatData[chat].total++
     log(`[${logIndex}] Processed ${filePath} from URL for ${service}: ${result}`)
