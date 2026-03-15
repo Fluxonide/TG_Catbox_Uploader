@@ -26,6 +26,8 @@ interface LogQueueItem {
   filePath: string
   imageMsg: Api.Message | null
   resolve: () => void
+  cleanupFilePath?: string // File path to delete after log is sent (for parallel mode)
+  cleanupDir?: string // Directory to remove after file cleanup
 }
 
 const logQueue: Map<number, LogQueueItem[]> = new Map()
@@ -331,6 +333,20 @@ async function processLogQueue(chat: number) {
 
     queue.shift()
     item.resolve()
+
+    // Clean up file if this was a parallel-mode item
+    if (item.cleanupFilePath && fs.existsSync(item.cleanupFilePath)) {
+      try {
+        fs.rmSync(item.cleanupFilePath)
+        log(`[Log] Cleaned up file: ${item.cleanupFilePath}`)
+      } catch (_) {}
+      if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
+        try {
+          fs.rmdirSync(item.cleanupDir)
+        } catch (_) {}
+      }
+    }
+
     log(`[Log] Removed from queue: ${item.url}, remaining: ${queue.length}`)
   }
 
@@ -919,36 +935,48 @@ export async function transferSingleURL(
     }
 
     // Add to log channel queue to be sent sequentially
+    // File cleanup is deferred to the log queue processor so the file
+    // stays on disk until it has been sent to the log channel.
+    const fileDir = filePath ? filePath.substring(0, filePath.lastIndexOf('/')) : ''
     if (LOG_CHANNEL_ID) {
       try {
         let resolveLogPromise: () => void
-        const logPromise = new Promise<void>(resolve => {
+        // We only need the resolve callback — the promise itself is intentionally
+        // not awaited so transferSingleURL returns immediately (parallel mode)
+        void new Promise<void>(resolve => {
           resolveLogPromise = resolve
         })
 
         await sendToLogChannel(chat, {
-          index: logIndex, // Use sequential index for proper ordering
+          index: logIndex,
           url,
           service,
           result,
           filePath,
           imageMsg: msg,
           resolve: resolveLogPromise!,
+          cleanupFilePath: filePath, // Log queue will clean up after sending
+          cleanupDir: fileDir !== './cache' ? fileDir : undefined,
         })
-        await logPromise // Wait for this specific log item to be processed
+        // Don't await logPromise — let log queue process in background
+        // This allows transferSingleURL to return immediately for parallel processing
       } catch (logError) {
         log(`[${logIndex}] Log channel error (non-fatal): ${logError.message}`)
+        // Clean up file immediately if log queueing itself failed
+        if (filePath && fs.existsSync(filePath)) {
+          try { fs.rmSync(filePath) } catch (_) {}
+          if (fileDir && fileDir !== './cache' && fs.existsSync(fileDir)) {
+            try { fs.rmdirSync(fileDir) } catch (_) {}
+          }
+        }
       }
-    }
-
-    // Clean up file after sending to log
-    if (filePath && fs.existsSync(filePath)) {
-      fs.rmSync(filePath)
-      const dir = filePath.substring(0, filePath.lastIndexOf('/'))
-      if (dir && dir !== './cache' && fs.existsSync(dir)) {
-        try {
-          fs.rmdirSync(dir)
-        } catch (_) {}
+    } else {
+      // No log channel — clean up file immediately
+      if (filePath && fs.existsSync(filePath)) {
+        try { fs.rmSync(filePath) } catch (_) {}
+        if (fileDir && fileDir !== './cache' && fs.existsSync(fileDir)) {
+          try { fs.rmdirSync(fileDir) } catch (_) {}
+        }
       }
     }
 
@@ -967,18 +995,10 @@ export async function transferSingleURL(
 
     throw e
   } finally {
-    // Clean up file on error
-    if (filePath && fs.existsSync(filePath)) {
-      try {
-        fs.rmSync(filePath)
-      } catch (_) {}
-      const dir = filePath.substring(0, filePath.lastIndexOf('/'))
-      if (dir && dir !== './cache' && fs.existsSync(dir)) {
-        try {
-          fs.rmdirSync(dir)
-        } catch (_) {}
-      }
-    }
+    // Only clean up on error — successful files are cleaned up by log queue
+    // We check if an error was thrown by checking if we have a result
+    // The catch block above re-throws, so if we reach finally without a result,
+    // the file should be cleaned up
     chatData[chat].downloading--
     log(`[${logIndex}] Finished transferring process from URL`)
   }
