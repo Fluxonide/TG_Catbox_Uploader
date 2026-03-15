@@ -13,6 +13,7 @@ export const LOG_CHANNEL_ID = parseInt(process.env.LOG_CHANNEL_ID)
 export const CATBOX_TOKEN = process.env.CATBOX_TOKEN
 export const DOWNLOAD_DC_ID = parseInt(process.env.DOWNLOAD_DC_ID) || 5
 export const DOWNLOAD_WORKERS = parseInt(process.env.DOWNLOAD_WORKERS) || 5
+export const PARALLEL_DOWNLOADS = parseInt(process.env.PARALLEL_DOWNLOADS || '') || 3
 export const ALLOWED_USERS = process.env.ALLOWED_USERS
   ? process.env.ALLOWED_USERS.split(',').map(id => parseInt(id.trim()))
   : []
