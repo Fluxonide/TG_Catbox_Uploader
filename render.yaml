@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: tg-catbox-uploader
     env: node
     region: oregon
@@ -9,6 +9,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PORT
+        value: 10000
       - key: API_ID
         sync: false
       - key: API_HASH
@@ -34,3 +36,4 @@ services:
       - key: BOT_NAME
         value: Catbox Uploader
     autoDeploy: true
+    healthCheckPath: /health
