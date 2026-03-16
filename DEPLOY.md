@@ -185,5 +185,5 @@ The bot exposes a simple HTTP health check endpoint when `PORT` environment vari
 ## Recommendations
 
 - **Railway**: Best for 24/7 operation with persistent storage
-- **Render**: Good for 24/7 operation, no cold starts for worker services
+- **Render**: Good for 24/7 operation with uptime monitoring
 - **Docker**: Best for VPS/self-hosted with full control
