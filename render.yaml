@@ -4,7 +4,7 @@ services:
     env: node
     region: oregon
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci && npm run build
     startCommand: node start.js
     envVars:
       - key: NODE_ENV
@@ -26,14 +26,14 @@ services:
       - key: LOG_CHANNEL_ID
         sync: false
       - key: MAX_DOWNLOADING
-        value: 3
+        value: '3'
       - key: DOWNLOAD_WORKERS
-        value: 4
+        value: '4'
       - key: DOWNLOAD_DC_ID
-        value: 4
+        value: '4'
       - key: PARALLEL_DOWNLOADS
-        value: 5
+        value: '5'
       - key: BOT_NAME
-        value: Catbox Uploader
+        value: 'Catbox Uploader'
     autoDeploy: true
     healthCheckPath: /health
