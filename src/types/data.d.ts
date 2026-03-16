@@ -12,6 +12,7 @@ export interface BatchProgressState {
   chat: number
   isComplete: boolean
   isCancelled: boolean
+  abortController?: AbortController
 }
 
 export interface UserData {
