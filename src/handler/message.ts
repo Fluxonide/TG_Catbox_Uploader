@@ -177,6 +177,9 @@ async function handleURLMessage(msg: any) {
       return '█'.repeat(filled) + '░'.repeat(length - filled)
     }
 
+    // Create AbortController for cancellation
+    const abortController = new AbortController()
+
     // Store progress state for refresh button
     const progressState = {
       completed,
@@ -188,6 +191,7 @@ async function handleURLMessage(msg: any) {
       chat,
       isComplete: false,
       isCancelled: false,
+      abortController,
       logStartTime: null as number | null,
       logLastDone: 0,
       logLastTime: null as number | null,
@@ -287,7 +291,7 @@ async function handleURLMessage(msg: any) {
       try {
         console.log(`[${i + 1}/${urls.length}] Processing: ${currentUrl}`)
 
-        const result = await transferSingleURL(msg, currentUrl, i + 1, urls.length, statusMsg.id)
+        const result = await transferSingleURL(msg, currentUrl, i + 1, urls.length, statusMsg.id, abortController.signal)
 
         if (result) {
           progressState.completed++
