@@ -260,6 +260,479 @@ class OwnerCommands {
       bot.sendMessage(this.chat, { message: `Failed to send: ${e.message}` }).catch(console.error)
     }
   }
+
+  async dlx(url: string) {
+    if (!LOG_CHANNEL_ID) {
+      return bot
+        .sendMessage(this.chat, { message: 'LOG_CHANNEL_ID is not configured.' })
+        .catch(console.error)
+    }
+    if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
+      await bot.sendMessage(this.chat, {
+        message:
+          '❌ Usage: /dlx <url>\n\nProvide a URL to a text file containing /send blocks.\n\nFormat:\n<code>/send &lt;url&gt; &lt;Title&gt;\nlink1\nlink2\n\n/send &lt;Title&gt;\nlink1\nlink2</code>',
+        parseMode: 'html',
+      })
+      return
+    }
+
+    const statusMsg = await bot.sendMessage(this.chat, {
+      message: '📄 Downloading command list...',
+    })
+
+    try {
+      // Download the text file
+      const urlObj = new URL(url)
+      const referer = `${urlObj.protocol}//${urlObj.host}/`
+
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Accept: 'text/plain,text/html,*/*',
+          'Accept-Encoding': 'gzip, deflate, br',
+          Referer: referer,
+          'Cache-Control': 'no-cache',
+        },
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+      }
+
+      const content = await response.text()
+      const lines = content.split(/\r?\n/)
+
+      // Parse blocks: each block starts with /send line, followed by URL lines
+      interface SendBlock {
+        sendUrl: string | null // URL from the /send line (if any)
+        title: string // Caption/title
+        mediaUrls: string[] // Media URLs to download and send
+      }
+
+      const blocks: SendBlock[] = []
+      let currentBlock: SendBlock | null = null
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim()
+        if (!line) continue
+
+        if (line.startsWith('/send ')) {
+          // Save previous block
+          if (currentBlock) blocks.push(currentBlock)
+
+          // Parse /send line
+          const sendArgs = line.substring(6).trim() // after '/send '
+          const sendParts = sendArgs.split(/\s+/)
+
+          if (sendParts[0] && (sendParts[0].startsWith('http://') || sendParts[0].startsWith('https://'))) {
+            // /send <url> <title>
+            currentBlock = {
+              sendUrl: sendParts[0],
+              title: sendParts.slice(1).join(' '),
+              mediaUrls: [],
+            }
+          } else {
+            // /send <title>
+            currentBlock = {
+              sendUrl: null,
+              title: sendArgs,
+              mediaUrls: [],
+            }
+          }
+        } else if (currentBlock && (line.startsWith('http://') || line.startsWith('https://'))) {
+          currentBlock.mediaUrls.push(line)
+        }
+      }
+      // Push last block
+      if (currentBlock) blocks.push(currentBlock)
+
+      if (blocks.length === 0) {
+        await bot.editMessage(this.chat, {
+          message: statusMsg.id,
+          text: '❌ No /send blocks found in the file.',
+        })
+        return
+      }
+
+      // Count total operations
+      let totalOps = 0
+      for (const block of blocks) {
+        totalOps += 1 // the /send header itself
+        totalOps += block.mediaUrls.length
+      }
+
+      // Create AbortController and progress state for cancellation
+      const abortController = new AbortController()
+      const progressState = {
+        completed: 0,
+        failed: 0,
+        failedUrls: [] as Array<{ index: number; url: string; error: string }>,
+        startTime: Date.now(),
+        totalUrls: totalOps,
+        statusMsgId: statusMsg.id,
+        chat: this.chat,
+        isComplete: false,
+        isCancelled: false,
+        abortController,
+        logStartTime: null as number | null,
+        logLastDone: 0,
+        logLastTime: null as number | null,
+      }
+
+      chatData[this.chat].batchProgress = progressState
+
+      await bot.editMessage(this.chat, {
+        message: statusMsg.id,
+        text: `✅ Found ${blocks.length} /send block(s) with ${totalOps} total operations.\n\nProcessing...`,
+      })
+
+      // Need transferSingleURL to handle the downloads
+      const { transferSingleURL, getLogQueueStatus } = await import('./transfer.js')
+
+      let opIndex = 0
+
+      const secToTime = (sec: number) => {
+        if (!isFinite(sec) || sec < 0) return '00:00:00'
+        const hour = Math.floor(sec / 3600)
+        const min = Math.floor((sec - hour * 3600) / 60)
+        const secs = sec - hour * 3600 - min * 60
+        return [
+          hour.toString().padStart(2, '0'),
+          min.toString().padStart(2, '0'),
+          secs.toString().padStart(2, '0'),
+        ].join(':')
+      }
+
+      const buildProgressBar = (progress: number) => {
+        const length = 20
+        const filled = Math.round((progress / 100) * length)
+        return '█'.repeat(filled) + '░'.repeat(length - filled)
+      }
+
+      const updateProgress = async (showButton = false) => {
+        if (progressState.isCancelled) return
+
+        const elapsed = (Date.now() - progressState.startTime) / 1000
+        const rate = (progressState.completed + progressState.failed) / elapsed
+        const eta = rate > 0 ? Math.round((totalOps - (progressState.completed + progressState.failed)) / rate) : 0
+        const progress = Math.round(((progressState.completed + progressState.failed) / totalOps) * 100) || 0
+
+        let text =
+          `<b>📦 /dlx Progress</b>\n\n` +
+          `✅ ${progressState.completed} | ❌ ${progressState.failed} | ⏳ ${totalOps - (progressState.completed + progressState.failed)} remaining\n` +
+          `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n` +
+          `⏱ ETA: <code>${secToTime(eta)}</code>`
+
+        const logStatus = getLogQueueStatus(this.chat)
+        const totalLogs = progressState.totalUrls
+        const logsDone = Math.max(0, totalLogs - logStatus.pending)
+        const logProgress = totalLogs > 0 ? Math.round((logsDone / totalLogs) * 100) : 0
+
+        // Track log start time once logs begin processing
+        if (logsDone > 0 && progressState.logStartTime === null) {
+          progressState.logStartTime = Date.now()
+          progressState.logLastDone = logsDone
+          progressState.logLastTime = Date.now()
+        }
+
+        // Compute log ETA using a rolling rate (last snapshot → now)
+        let logEta = 0
+        if (progressState.logLastTime !== null && logsDone > progressState.logLastDone) {
+          const logElapsed = (Date.now() - progressState.logLastTime) / 1000
+          const logRate = (logsDone - progressState.logLastDone) / logElapsed // logs/sec
+          logEta = logRate > 0 ? Math.round(logStatus.pending / logRate) : 0
+          progressState.logLastDone = logsDone
+          progressState.logLastTime = Date.now()
+        } else if (progressState.logStartTime !== null) {
+          const logElapsed = (Date.now() - progressState.logStartTime) / 1000
+          const logRate = logsDone > 0 ? logsDone / logElapsed : 0
+          logEta = logRate > 0 ? Math.round(logStatus.pending / logRate) : 0
+        }
+
+        text += `\n\n<b>📤 Uploading Logs</b>\n`
+        text += `✅ ${logsDone} | ⏳ ${logStatus.pending} remaining\n`
+        text += `<code>[${buildProgressBar(logProgress)}]</code> ${logProgress}%\n`
+        text += `⏱ ETA: <code>${secToTime(logEta)}</code>`
+
+        if (progressState.failedUrls.length > 0 && progressState.failedUrls.length <= 5) {
+          const failedList = progressState.failedUrls
+            .slice(0, 5)
+            .map(f => `${f.index + 1}. ${f.error}`)
+            .join('\n')
+          text += `\n\n<b>❌ Failed:</b>\n${failedList}`
+        } else if (progressState.failedUrls.length > 5) {
+          text += `\n\n<b>❌ ${progressState.failedUrls.length} failed</b>`
+        }
+
+        const buttonsModule = await import('./buttons.js')
+
+        await bot
+          .editMessage(this.chat, {
+            message: statusMsg.id,
+            text,
+            parseMode: 'html',
+            linkPreview: false,
+            buttons:
+              showButton && !progressState.isComplete
+                ? buttonsModule.refreshProgress(this.chat)
+                : undefined,
+          })
+          .catch(() => {})
+      }
+
+      // Auto-update progress every 5 seconds
+      const progressInterval = setInterval(() => {
+        if (!progressState.isComplete) {
+          updateProgress().catch(() => {})
+        }
+      }, 5000)
+
+      for (let b = 0; b < blocks.length; b++) {
+        if (progressState.isCancelled) break
+
+        const block = blocks[b]
+        const captionText = block.title ? `<b><i><u>${block.title}</u></i></b>` : ''
+
+        // Send title text first if no URL
+        if (captionText && !block.sendUrl) {
+          try {
+            await bot.sendMessage(LOG_CHANNEL_ID, {
+              message: captionText,
+              parseMode: 'html',
+              linkPreview: false,
+            })
+            progressState.completed++
+          } catch (e) {
+            progressState.failed++
+            console.error(`[dlx] /send title failed: ${e.message}`)
+          }
+        }
+        
+        // Wait for log queue between headers or blocks if needed
+        let logStatus = getLogQueueStatus(this.chat)
+        while (!progressState.isCancelled && (logStatus.pending > 0 || logStatus.processing)) {
+           await sleep(1000)
+           logStatus = getLogQueueStatus(this.chat)
+        }
+        
+        opIndex++
+
+        // If the header had a URL, process it using the original /send logic
+        if (block.sendUrl) {
+           if (!progressState.isCancelled && !abortController.signal.aborted) {
+             try {
+               const sendUrlObj = new URL(block.sendUrl)
+               const referer = `${sendUrlObj.protocol}//${sendUrlObj.host}/`
+
+               const response = await fetch(block.sendUrl, {
+                 headers: {
+                   'User-Agent':
+                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                   Accept: 'image/*,video/*,*/*',
+                   'Accept-Encoding': 'gzip, deflate, br',
+                   'Accept-Language': 'en-US,en;q=0.9',
+                   Connection: 'keep-alive',
+                   Referer: referer,
+                   Origin: `${sendUrlObj.protocol}//${sendUrlObj.host}`,
+                   'Sec-Fetch-Dest': 'image',
+                   'Sec-Fetch-Mode': 'no-cors',
+                   'Sec-Fetch-Site': 'same-origin',
+                   'Cache-Control': 'no-cache',
+                   Pragma: 'no-cache',
+                 },
+                 signal: abortController.signal,
+               })
+
+               if (!response.ok) {
+                 throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+               }
+
+               // Get filename from URL
+               const urlPath = new URL(block.sendUrl).pathname
+               let filename = urlPath.split('/').pop() || 'download'
+
+               // Try to decode filename
+               try {
+                 filename = decodeURIComponent(filename)
+               } catch (e) {
+                 // Keep original if decode fails
+               }
+
+               // If no extension, try to get from content-type
+               if (!filename.includes('.')) {
+                 const contentType = response.headers.get('content-type')
+                 if (contentType) {
+                   const ext = mime.extension(contentType)
+                   if (ext) filename += `.${ext}`
+                 }
+               }
+
+               const uniqueDir = `./cache/${this.chat}_${Date.now()}`
+               fs.mkdirSync(uniqueDir, { recursive: true })
+               const filePath = `${uniqueDir}/${filename}`
+
+               // Download file with streaming
+               const reader = response.body?.getReader()
+               if (!reader) throw new Error('Failed to get response body reader')
+
+               const fileStream = fs.createWriteStream(filePath)
+
+               while (true) {
+                 if (abortController.signal.aborted) {
+                   reader.cancel()
+                   fileStream.end()
+                   throw new Error('Cancelled')
+                 }
+                 const { done, value } = await reader.read()
+                 if (done) break
+                 fileStream.write(value)
+               }
+
+               fileStream.end()
+               await new Promise<void>((resolve, reject) => {
+                 fileStream.on('finish', () => resolve())
+                 fileStream.on('error', reject)
+               })
+
+               if (abortController.signal.aborted) throw new Error('Cancelled')
+
+               // Upload to log channel with caption
+               await bot.sendFile(LOG_CHANNEL_ID, {
+                 file: filePath,
+                 caption: captionText,
+                 parseMode: 'html',
+                 forceDocument: false,
+               })
+
+               // Clean up
+               if (fs.existsSync(filePath)) {
+                 fs.rmSync(filePath)
+                 if (fs.existsSync(uniqueDir)) {
+                   try {
+                     fs.rmdirSync(uniqueDir)
+                   } catch (_) {}
+                 }
+               }
+
+               progressState.completed++
+             } catch (e) {
+                progressState.failed++
+                progressState.failedUrls.push({ index: opIndex, url: block.sendUrl, error: e.message })
+             }
+           }
+        }
+
+        // Now process each media URL sequentially
+        for (let m = 0; m < block.mediaUrls.length; m++) {
+          if (progressState.isCancelled || abortController.signal.aborted) break
+
+          const mediaUrl = block.mediaUrls[m]
+          opIndex++
+
+          try {
+            const syntheticMsg = {
+              peerId: {
+                className: 'PeerUser',
+                userId: {
+                  toJSNumber: () => this.chat,
+                  toString: () => this.chat.toString(),
+                },
+              },
+              id: opIndex,
+            } as any
+
+            const result = await transferSingleURL(syntheticMsg, mediaUrl, opIndex, totalOps, statusMsg.id, abortController.signal)
+            if(!result) {
+                progressState.failed++
+                progressState.failedUrls.push({ index: opIndex, url: mediaUrl, error: 'File too big or empty' })
+            } else {
+                progressState.completed++
+            }
+          } catch (e) {
+            progressState.failed++
+            progressState.failedUrls.push({ index: opIndex, url: mediaUrl, error: e.message })
+          }
+
+          // Important: Wait for log queue to process to maintain order within the block
+          logStatus = getLogQueueStatus(this.chat)
+          while (!progressState.isCancelled && (logStatus.pending > 0 || logStatus.processing)) {
+             await sleep(1000)
+             logStatus = getLogQueueStatus(this.chat)
+          }
+
+          // Small delay between uploads
+          await sleep(500)
+        }
+
+        // Wait for all logs in this block to finish before moving to the next block
+        logStatus = getLogQueueStatus(this.chat)
+        while (!progressState.isCancelled && (logStatus.pending > 0 || logStatus.processing)) {
+           await sleep(1000)
+           logStatus = getLogQueueStatus(this.chat)
+        }
+        
+        // Delay between blocks
+        if (b < blocks.length - 1 && !progressState.isCancelled) {
+          await sleep(1000)
+        }
+      }
+
+      // Stop auto-update
+      clearInterval(progressInterval)
+
+      // Final summary
+      progressState.isComplete = true
+      const totalElapsed = (Date.now() - progressState.startTime) / 1000
+
+      function secToTimeLocal(sec: number) {
+        if (!isFinite(sec) || sec < 0) return '00:00:00'
+        const hour = Math.floor(sec / 3600)
+        const min = Math.floor((sec - hour * 3600) / 60)
+        const secs = sec - hour * 3600 - min * 60
+        return [
+          hour.toString().padStart(2, '0'),
+          min.toString().padStart(2, '0'),
+          secs.toString().padStart(2, '0'),
+        ].join(':')
+      }
+
+      let finalText = progressState.isCancelled
+        ? `<b>🛑 /dlx Cancelled!</b>\n\n`
+        : `<b>✅ /dlx Complete!</b>\n\n`
+
+      finalText += `📦 Blocks: ${blocks.length}\n`
+      finalText += `📊 ${progressState.completed}/${totalOps} successful`
+      if (progressState.failed > 0) finalText += ` | ❌ ${progressState.failed} failed`
+      finalText += `\n⏱ Total time: <code>${secToTimeLocal(Math.round(totalElapsed))}</code>`
+
+      if (progressState.failedUrls.length > 0) {
+        const failedList = progressState.failedUrls
+          .slice(0, 10)
+          .map(f => `${f.index + 1}. ${f.error}`)
+          .join('\n')
+        finalText += `\n\n<b>❌ Failed:</b>\n${failedList}`
+        if (progressState.failedUrls.length > 10) {
+          finalText += `\n... and ${progressState.failedUrls.length - 10} more`
+        }
+      }
+
+      await bot.editMessage(this.chat, {
+        message: statusMsg.id,
+        text: finalText,
+        parseMode: 'html',
+        linkPreview: false,
+      })
+
+      // Clean up progress state
+      delete chatData[this.chat].batchProgress
+    } catch (error) {
+      await bot.editMessage(this.chat, {
+        message: statusMsg.id,
+        text: `❌ Error processing /dlx: ${error.message}`,
+      })
+    }
+  }
 }
 
 class GeneralCommands {
@@ -383,6 +856,11 @@ class GeneralCommands {
     // Set the cancel flag
     progressState.isCancelled = true
 
+    // Abort any in-progress downloads/uploads immediately
+    if (progressState.abortController) {
+      progressState.abortController.abort()
+    }
+
     // Update the progress message to show cancellation
     const totalProcessed = progressState.completed + progressState.failed
     const progress = Math.round((totalProcessed / progressState.totalUrls) * 100)
@@ -409,11 +887,11 @@ class GeneralCommands {
       return '█'.repeat(filled) + '░'.repeat(length - filled)
     }
 
-    let text = `<b>🛑 Cancelling Batch Download...</b>\n\n`
+    let text = `<b>🛑 Cancelling Batch...</b>\n\n`
     text += `✅ ${progressState.completed} | ❌ ${progressState.failed} | 📊 ${totalProcessed}/${progressState.totalUrls}\n`
     text += `<code>[${buildProgressBar(progress)}]</code> ${progress}%\n`
     text += `⏱ ETA: <code>${secToTime(eta)}</code>\n\n`
-    text += `<i>Current file will finish, then the process will stop.</i>`
+    text += `<i>Aborting in-progress downloads and stopping log uploads...</i>`
 
     await bot
       .editMessage(this.chat, {
@@ -508,6 +986,9 @@ class GeneralCommands {
         return '█'.repeat(filled) + '░'.repeat(length - filled)
       }
 
+      // Create AbortController for cancellation
+      const abortController = new AbortController()
+
       // Store progress state for refresh button
       const progressState = {
         completed,
@@ -519,6 +1000,7 @@ class GeneralCommands {
         chat: this.chat,
         isComplete: false,
         isCancelled: false,
+        abortController,
         logStartTime: null as number | null,
         logLastDone: 0,
         logLastTime: null as number | null,
@@ -638,6 +1120,7 @@ class GeneralCommands {
               i + 1,
               urls.length,
               statusMsgId,
+              abortController.signal,
             )
 
             if (result) {
