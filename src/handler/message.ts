@@ -9,6 +9,10 @@ import type { NewMessageEvent } from 'telegram/events/NewMessage.js'
 // Message handler
 export async function handleMessage(event: NewMessageEvent) {
   const msg = event.message
+
+  // Ignore messages from the bot itself to prevent infinite loops
+  if (msg.out) return
+
   // Currently, only support private messages
   if (msg.peerId.className !== 'PeerUser') return
   const chatId = msg.peerId.userId.toString()
@@ -291,7 +295,14 @@ async function handleURLMessage(msg: any) {
       try {
         console.log(`[${i + 1}/${urls.length}] Processing: ${currentUrl}`)
 
-        const result = await transferSingleURL(msg, currentUrl, i + 1, urls.length, statusMsg.id, abortController.signal)
+        const result = await transferSingleURL(
+          msg,
+          currentUrl,
+          i + 1,
+          urls.length,
+          statusMsg.id,
+          abortController.signal,
+        )
 
         if (result) {
           progressState.completed++
