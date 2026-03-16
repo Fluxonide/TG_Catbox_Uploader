@@ -296,9 +296,29 @@ async function processLogQueue(chat: number) {
 
             if (imageMsg) {
               // Always send original file as document reply
+              // Rename file to match catbox URL filename if available
+              let docFilePath = item.filePath
+              let renamedPath: string | null = null
+              if (item.result) {
+                try {
+                  const catboxFilename = new URL(item.result).pathname.split('/').pop()
+                  if (catboxFilename) {
+                    const dir = item.filePath.substring(0, item.filePath.lastIndexOf('/'))
+                    renamedPath = `${dir}/${catboxFilename}`
+                    if (renamedPath !== item.filePath) {
+                      fs.copyFileSync(item.filePath, renamedPath)
+                      docFilePath = renamedPath
+                    } else {
+                      renamedPath = null
+                    }
+                  }
+                } catch (_) {
+                  // Fallback to original path
+                }
+              }
               await Promise.race([
                 bot.sendFile(LOG_CHANNEL_ID, {
-                  file: item.filePath,
+                  file: docFilePath,
                   forceDocument: true,
                   replyTo: imageMsg.id,
                 }),
@@ -308,6 +328,10 @@ async function processLogQueue(chat: number) {
               ]).catch(e => {
                 log(`[Log] Failed to send raw document: ${e.message}`)
               })
+              // Clean up renamed file
+              if (renamedPath && renamedPath !== item.filePath && fs.existsSync(renamedPath)) {
+                try { fs.rmSync(renamedPath) } catch (_) {}
+              }
             } else {
               // Fallback: send just the caption if file upload failed
               log(`[Log] File upload failed, sending caption only`)
@@ -711,6 +735,7 @@ export async function transferSingleURL(
   logIndex: number, // Sequential index for log ordering across batches
   totalInBatch: number,
   statusMsgId: number,
+  abortSignal?: AbortSignal,
 ): Promise<string | null> {
   if (msg.peerId.className !== 'PeerUser') return null
   const chat = msg.peerId.userId.toJSNumber()
@@ -741,8 +766,17 @@ export async function transferSingleURL(
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
+        // Check if already cancelled before starting
+        if (abortSignal?.aborted) {
+          throw new Error('Cancelled')
+        }
+
         const controller = new AbortController()
         const timeout = setTimeout(() => controller.abort(), 30000) // 30s timeout per request
+
+        // If the parent abort signal fires, abort this fetch too
+        const onAbort = () => controller.abort()
+        abortSignal?.addEventListener('abort', onAbort, { once: true })
 
         // Extract domain for Referer header
         const urlObj = new URL(url)
@@ -767,6 +801,7 @@ export async function transferSingleURL(
           signal: controller.signal,
         })
         clearTimeout(timeout)
+        abortSignal?.removeEventListener('abort', onAbort)
 
         if (!response.ok) {
           if (response.status === 503 || response.status === 429 || response.status === 408) {
@@ -879,6 +914,12 @@ export async function transferSingleURL(
 
     let downloadedBytes = 0
     while (true) {
+      // Check abort between chunks
+      if (abortSignal?.aborted) {
+        reader.cancel()
+        fileStream.end()
+        throw new Error('Cancelled')
+      }
       const { done, value } = await reader.read()
       if (done) break
       fileStream.write(value)
@@ -926,6 +967,11 @@ export async function transferSingleURL(
     // Upload to Catbox / Litterbox with retry and animated progress
     let result!: string
     let isCached = false
+
+    // Check abort before upload
+    if (abortSignal?.aborted) {
+      throw new Error('Cancelled')
+    }
 
     if (cachedCatboxUrl) {
       log(`[${logIndex}] URL already uploaded, using cache: ${url} -> ${cachedCatboxUrl}`)
