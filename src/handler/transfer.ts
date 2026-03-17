@@ -137,28 +137,7 @@ async function processLogQueue(chat: number) {
   log(`[Log] Processing queue for chat ${chat}, queue length: ${queue.length}`)
 
   while (queue.length > 0) {
-    // Check if batch was cancelled
-    const progressState = chatData[chat]?.batchProgress
-    if (progressState?.isCancelled) {
-      log(`[Log] Batch cancelled, stopping log queue for chat ${chat}`)
-      // Resolve all remaining items and clear queue
-      while (queue.length > 0) {
-        const item = queue.shift()!
-        item.resolve()
-        // Clean up files
-        if (item.cleanupFilePath && fs.existsSync(item.cleanupFilePath)) {
-          try {
-            fs.rmSync(item.cleanupFilePath)
-          } catch (_) {}
-          if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
-            try {
-              fs.rmdirSync(item.cleanupDir)
-            } catch (_) {}
-          }
-        }
-      }
-      break
-    }
+
 
     // Sort queue by index to maintain order
     queue.sort((a, b) => a.index - b.index)
@@ -232,24 +211,44 @@ async function processLogQueue(chat: number) {
 
             // Try to send preview (or original if small) as compressed photo
             const fileToSend = previewPath || item.filePath
-            imageMsg = (await Promise.race([
-              bot.sendFile(LOG_CHANNEL_ID, {
-                file: fileToSend,
-                caption: captionStr,
-                forceDocument: false,
-                attributes: [],
-              }),
-              new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
-              ),
-            ]).catch(e => {
-              log(`[Log] Failed to send compressed photo: ${e.message}`)
-              // If AUTH_KEY_DUPLICATED, wait and let other operations complete
-              if (e.message.includes('AUTH_KEY_DUPLICATED')) {
-                return new Promise(resolve => setTimeout(() => resolve(null), 2000))
+            let uploadRetries = 3
+            let retryDelay = 2000
+
+            while (uploadRetries > 0 && !imageMsg) {
+              imageMsg = (await Promise.race([
+                bot.sendFile(LOG_CHANNEL_ID, {
+                  file: fileToSend,
+                  caption: captionStr,
+                  forceDocument: false,
+                  attributes: [],
+                }),
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+                ),
+              ]).catch(e => {
+                log(`[Log] Failed to send compressed photo: ${e.message}`)
+                if (
+                  e.message.includes('AUTH_KEY_DUPLICATED') ||
+                  e.message.includes('timeout') ||
+                  e.message.includes('ECONNRESET') ||
+                  e.message.includes('RPC_CALL_FAIL') ||
+                  e.message.includes('Flood')
+                ) {
+                  return null // Indicates transient error, allow retry
+                }
+                uploadRetries = 0 // Fatal error, don't retry photo upload
+                return null
+              })) as Api.Message | null
+
+              if (!imageMsg && uploadRetries > 0) {
+                uploadRetries--
+                if (uploadRetries > 0) {
+                  log(`[Log] Retrying photo upload... (${uploadRetries} left)`)
+                  await new Promise(resolve => setTimeout(resolve, retryDelay))
+                  retryDelay *= 2
+                }
               }
-              return null
-            })) as Api.Message | null
+            }
 
             // If compressed photo failed, create smaller preview and retry
             if (!imageMsg && previewPath) {
@@ -258,40 +257,86 @@ async function processLogQueue(chat: number) {
               previewPath = await createCompressedPreview(item.filePath, 1024)
 
               if (previewPath) {
-                imageMsg = (await Promise.race([
-                  bot.sendFile(LOG_CHANNEL_ID, {
-                    file: previewPath,
-                    caption: captionStr,
-                    forceDocument: false,
-                    attributes: [],
-                  }),
-                  new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
-                  ),
-                ]).catch(e => {
-                  log(`[Log] Failed to send smaller preview: ${e.message}`)
-                  return null
-                })) as Api.Message | null
+                uploadRetries = 3
+                retryDelay = 2000
+                while (uploadRetries > 0 && !imageMsg) {
+                  imageMsg = (await Promise.race([
+                    bot.sendFile(LOG_CHANNEL_ID, {
+                      file: previewPath,
+                      caption: captionStr,
+                      forceDocument: false,
+                      attributes: [],
+                    }),
+                    new Promise((_, reject) =>
+                      setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+                    ),
+                  ]).catch(e => {
+                    log(`[Log] Failed to send smaller preview: ${e.message}`)
+                    if (
+                      e.message.includes('AUTH_KEY_DUPLICATED') ||
+                      e.message.includes('timeout') ||
+                      e.message.includes('ECONNRESET') ||
+                      e.message.includes('RPC_CALL_FAIL') ||
+                      e.message.includes('Flood')
+                    ) {
+                      return null
+                    }
+                    uploadRetries = 0
+                    return null
+                  })) as Api.Message | null
+                  
+                  if (!imageMsg && uploadRetries > 0) {
+                    uploadRetries--
+                    if (uploadRetries > 0) {
+                      log(`[Log] Retrying smaller preview upload... (${uploadRetries} left)`)
+                      await new Promise(resolve => setTimeout(resolve, retryDelay))
+                      retryDelay *= 2
+                    }
+                  }
+                }
               }
             }
 
             // Last resort: send as document
             if (!imageMsg) {
               log(`[Log] Sending as document (fallback)...`)
-              imageMsg = (await Promise.race([
-                bot.sendFile(LOG_CHANNEL_ID, {
-                  file: fileToSend,
-                  caption: captionStr,
-                  forceDocument: true,
-                  attributes: [],
-                }),
-                new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
-                ),
-              ]).catch(e => {
-                log(`[Log] Failed to send as document: ${e.message}`)
-                return null
-              })) as Api.Message | null
+              uploadRetries = 3
+              retryDelay = 2000
+              while (uploadRetries > 0 && !imageMsg) {
+                imageMsg = (await Promise.race([
+                  bot.sendFile(LOG_CHANNEL_ID, {
+                    file: fileToSend,
+                    caption: captionStr,
+                    forceDocument: true,
+                    attributes: [],
+                  }),
+                  new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+                  ),
+                ]).catch(e => {
+                  log(`[Log] Failed to send as document: ${e.message}`)
+                  if (
+                    e.message.includes('AUTH_KEY_DUPLICATED') ||
+                    e.message.includes('timeout') ||
+                    e.message.includes('ECONNRESET') ||
+                    e.message.includes('RPC_CALL_FAIL') ||
+                    e.message.includes('Flood')
+                  ) {
+                    return null
+                  }
+                  uploadRetries = 0
+                  return null
+                })) as Api.Message | null
+
+                if (!imageMsg && uploadRetries > 0) {
+                  uploadRetries--
+                  if (uploadRetries > 0) {
+                    log(`[Log] Retrying document fallback upload... (${uploadRetries} left)`)
+                    await new Promise(resolve => setTimeout(resolve, retryDelay))
+                    retryDelay *= 2
+                  }
+                }
+              }
             }
 
             if (imageMsg) {
@@ -316,18 +361,42 @@ async function processLogQueue(chat: number) {
                   // Fallback to original path
                 }
               }
-              await Promise.race([
-                bot.sendFile(LOG_CHANNEL_ID, {
-                  file: docFilePath,
-                  forceDocument: true,
-                  replyTo: imageMsg.id,
-                }),
-                new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
-                ),
-              ]).catch(e => {
-                log(`[Log] Failed to send raw document: ${e.message}`)
-              })
+              let docRetries = 3
+              let docRetryDelay = 2000
+              let docSent = false
+              
+              while (docRetries > 0 && !docSent) {
+                await Promise.race([
+                  bot.sendFile(LOG_CHANNEL_ID, {
+                    file: docFilePath,
+                    forceDocument: true,
+                    replyTo: imageMsg.id,
+                  }),
+                  new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Upload timeout')), uploadTimeout),
+                  ),
+                ]).then(() => {
+                  docSent = true
+                }).catch(async e => {
+                  log(`[Log] Failed to send raw document: ${e.message}`)
+                  if (
+                    e.message.includes('AUTH_KEY_DUPLICATED') ||
+                    e.message.includes('timeout') ||
+                    e.message.includes('ECONNRESET') ||
+                    e.message.includes('RPC_CALL_FAIL') ||
+                    e.message.includes('Flood')
+                  ) {
+                    docRetries--
+                    if (docRetries > 0) {
+                      log(`[Log] Retrying original document reply... (${docRetries} left)`)
+                      await new Promise(resolve => setTimeout(resolve, docRetryDelay))
+                      docRetryDelay *= 2
+                    }
+                  } else {
+                    docRetries = 0 // fatal
+                  }
+                })
+              }
               // Clean up renamed file
               if (renamedPath && renamedPath !== item.filePath && fs.existsSync(renamedPath)) {
                 try {
