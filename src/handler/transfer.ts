@@ -49,7 +49,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1600): Promis
   try {
     const previewPath = filePath.replace(/\.(jpg|jpeg|png|webp)$/i, '_preview.jpg')
 
-    // First attempt: 1600px, Quality 72, sRGB
+    // First attempt: 1600px, Quality 68, sRGB
     await sharp(filePath)
       .resize(maxSize, maxSize, {
         fit: 'inside',
@@ -58,7 +58,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1600): Promis
       .withMetadata({ density: 72 }) // keep basic metadata
       .toColorspace('srgb') // enforce sRGB color profile
       .jpeg({
-        quality: 72,
+        quality: 68,
         progressive: false,
         mozjpeg: true, // Use mozjpeg for better compression
       })
@@ -68,7 +68,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1600): Promis
 
     // If preview is still > 1MB (1048576 bytes), forcibly reduce quality and resolution
     // The user requested 300KB - 1MB
-    let currentQuality = 72
+    let currentQuality = 68
     let currentSize = maxSize
 
     while (previewSize > 1000000 && currentQuality > 20) {
