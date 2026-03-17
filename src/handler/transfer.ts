@@ -45,11 +45,11 @@ export function getLogQueueStatus(chat: number): { pending: number; processing: 
 }
 
 // Create a compressed preview for large images
-async function createCompressedPreview(filePath: string, maxSize = 1600): Promise<string | null> {
+async function createCompressedPreview(filePath: string, maxSize = 1920): Promise<string | null> {
   try {
     const previewPath = filePath.replace(/\.(jpg|jpeg|png|webp)$/i, '_preview.jpg')
 
-    // First attempt: 1600px, Quality 72, sRGB
+    // First attempt: 1920px, Quality 80, sRGB
     await sharp(filePath)
       .resize(maxSize, maxSize, {
         fit: 'inside',
@@ -58,7 +58,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1600): Promis
       .withMetadata({ density: 72 }) // keep basic metadata
       .toColorspace('srgb') // enforce sRGB color profile
       .jpeg({
-        quality: 72,
+        quality: 80,
         progressive: false,
         mozjpeg: true, // Use mozjpeg for better compression
       })
@@ -68,7 +68,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1600): Promis
 
     // If preview is still > 1MB (1048576 bytes), forcibly reduce quality and resolution
     // The user requested 300KB - 1MB
-    let currentQuality = 72
+    let currentQuality = 80
     let currentSize = maxSize
 
     while (previewSize > 1000000 && currentQuality > 20) {
@@ -330,7 +330,9 @@ async function processLogQueue(chat: number) {
               })
               // Clean up renamed file
               if (renamedPath && renamedPath !== item.filePath && fs.existsSync(renamedPath)) {
-                try { fs.rmSync(renamedPath) } catch (_) {}
+                try {
+                  fs.rmSync(renamedPath)
+                } catch (_) {}
               }
             } else {
               // Fallback: send just the caption if file upload failed
