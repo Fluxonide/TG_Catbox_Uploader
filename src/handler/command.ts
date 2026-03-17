@@ -10,30 +10,44 @@ import mime from 'mime-types'
 
 // Bot command handler
 export async function handleCommand(msg: Api.Message) {
-  const text = msg.message,
-    chat = (msg.peerId as Api.PeerUser).userId.toJSNumber()
-  let command = text.split(' ')[0].substring(1)
-  const mention = command.split('@')[1]
-  // If the text contains mention, need to check if the mentioned target is the bot
-  if (mention && mention !== BOT_NAME) return
-  // Split the text into command and arguments
-  command = command.split('@')[0]
-  const arg = text.split(' ').slice(1).join(' ')
-  // Check if the command is valid
+  const text = msg.message
+  const chat = (msg.peerId as Api.PeerUser).userId.toJSNumber()
+
   const generalCmds = new GeneralCommands(msg)
   const ownerCmds = new OwnerCommands(msg)
 
-  console.log(
-    `[Command Debug] Trying command '${command}' for chat ${chat} (ADMIN_ID: ${ADMIN_ID})`,
-  )
-  console.log(
-    `[Command Debug] isGeneral: ${typeof (generalCmds as any)[command] === 'function'}, isOwner: ${typeof (ownerCmds as any)[command] === 'function'}`,
-  )
+  // Split message by lines starting with /
+  const blocks = text.split(/(?=^\/)/m).map(b => b.trim()).filter(b => b.startsWith('/'))
 
-  if (typeof (generalCmds as any)[command] === 'function') {
-    ;(generalCmds as any)[command](arg)
-  } else if (chat === ADMIN_ID && typeof (ownerCmds as any)[command] === 'function') {
-    ;(ownerCmds as any)[command](arg)
+  for (const block of blocks) {
+    const match = block.match(/^\/([^\s@]+)(?:@([^\s]+))?(?:\s+([\s\S]*))?$/)
+    if (!match) continue
+
+    const command = match[1]
+    const mention = match[2]
+    const arg = match[3] || ''
+
+    // If the text contains mention, need to check if the mentioned target is the bot
+    if (mention && mention !== BOT_NAME) continue
+
+    console.log(
+      `[Command Debug] Trying command '${command}' for chat ${chat} (ADMIN_ID: ${ADMIN_ID})`,
+    )
+    console.log(
+      `[Command Debug] isGeneral: ${typeof (generalCmds as any)[command] === 'function'}, isOwner: ${typeof (ownerCmds as any)[command] === 'function'}`,
+    )
+
+    try {
+      if (typeof (generalCmds as any)[command] === 'function') {
+        const result = (generalCmds as any)[command](arg)
+        if (result instanceof Promise) await result
+      } else if (chat === ADMIN_ID && typeof (ownerCmds as any)[command] === 'function') {
+        const result = (ownerCmds as any)[command](arg)
+        if (result instanceof Promise) await result
+      }
+    } catch (e) {
+      console.error(`[Command Error] Command ${command} failed:`, e)
+    }
   }
 }
 
@@ -123,9 +137,10 @@ class OwnerCommands {
 
     try {
       // Parse the command: first word is URL, rest is caption
-      const parts = text.split(' ')
-      const url = parts[0]
-      const caption = parts.slice(1).join(' ')
+      const match = text.match(/^(\S+)(?:\s+([\s\S]*))?$/)
+      if (!match) return bot.sendMessage(this.chat, { message: 'Failed to extract URL.' }).catch(console.error)
+      const url = match[1]
+      const caption = match[2] || ''
 
       // Check if it's a URL
       if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -267,6 +282,7 @@ class OwnerCommands {
         .sendMessage(this.chat, { message: 'LOG_CHANNEL_ID is not configured.' })
         .catch(console.error)
     }
+    url = url ? url.trim() : ''
     if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
       await bot.sendMessage(this.chat, {
         message:
@@ -904,6 +920,7 @@ class GeneralCommands {
   }
 
   async dl(url: string) {
+    url = url ? url.trim() : ''
     if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
       await bot.sendMessage(this.chat, {
         message:
