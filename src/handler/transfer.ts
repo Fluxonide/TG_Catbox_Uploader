@@ -45,11 +45,11 @@ export function getLogQueueStatus(chat: number): { pending: number; processing: 
 }
 
 // Create a compressed preview for large images
-async function createCompressedPreview(filePath: string, maxSize = 1920): Promise<string | null> {
+async function createCompressedPreview(filePath: string, maxSize = 1600): Promise<string | null> {
   try {
     const previewPath = filePath.replace(/\.(jpg|jpeg|png|webp)$/i, '_preview.jpg')
 
-    // First attempt: 1920px, Quality 72, sRGB
+    // First attempt: 1600px, Quality 72, sRGB
     await sharp(filePath)
       .resize(maxSize, maxSize, {
         fit: 'inside',
