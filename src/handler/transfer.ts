@@ -992,14 +992,20 @@ export async function transferSingleURL(
         throw new Error('Cancelled')
       }
       const { done, value } = await reader.read()
-      if (done) break
-      fileStream.write(value)
+      if (done) {
+        break
+      }
+      
+      // Await write stream to ensure data is actually flushed to disk
+      if (!fileStream.write(value)) {
+        await new Promise<void>(resolve => fileStream.once('drain', () => resolve()))
+      }
       downloadedBytes += value.length
     }
 
     fileStream.end()
     await new Promise<void>((resolve, reject) => {
-      fileStream.on('finish', () => resolve())
+      fileStream.on('finish', resolve)
       fileStream.on('error', reject)
     })
 
