@@ -45,11 +45,11 @@ export function getLogQueueStatus(chat: number): { pending: number; processing: 
 }
 
 // Create a compressed preview for large images
-async function createCompressedPreview(filePath: string, maxSize = 1600): Promise<string | null> {
+async function createCompressedPreview(filePath: string, maxSize = 1280): Promise<string | null> {
   try {
     const previewPath = filePath.replace(/\.(jpg|jpeg|png|webp)$/i, '_preview.jpg')
 
-    // First attempt: 1600px, Quality 68, sRGB
+    // First attempt: 1280px, Quality 65, sRGB
     await sharp(filePath)
       .resize(maxSize, maxSize, {
         fit: 'inside',
@@ -58,7 +58,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1600): Promis
       .withMetadata({ density: 72 }) // keep basic metadata
       .toColorspace('srgb') // enforce sRGB color profile
       .jpeg({
-        quality: 68,
+        quality: 65,
         progressive: false,
         mozjpeg: true, // Use mozjpeg for better compression
       })
@@ -68,7 +68,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1600): Promis
 
     // If preview is still > 1MB (1048576 bytes), forcibly reduce quality and resolution
     // The user requested 300KB - 1MB
-    let currentQuality = 68
+    let currentQuality = 65
     let currentSize = maxSize
 
     while (previewSize > 1000000 && currentQuality > 20) {
