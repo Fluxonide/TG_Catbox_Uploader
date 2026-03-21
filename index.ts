@@ -17,7 +17,7 @@ log('Login to Telegram...')
 
 export const bot = new TelegramClient(stringSession, API_ID, API_HASH, {
   connectionRetries: 5,
-  useWSS: false,
+  useWSS: true,
   autoReconnect: true,
 })
 
