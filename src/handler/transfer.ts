@@ -23,6 +23,7 @@ import type { Api } from 'telegram'
 
 // Queue for ordered log channel messages
 interface LogQueueItem {
+  chat: number
   index: number
   url: string
   service: string
@@ -35,13 +36,12 @@ interface LogQueueItem {
   isBatch?: boolean // True if part of a batch operation (URL list), false for single file uploads
 }
 
-const logQueue: Map<number, LogQueueItem[]> = new Map()
-const logProcessing: Map<number, boolean> = new Map()
+const logQueue: LogQueueItem[] = []
+let globalLogProcessing = false
 
 export function getLogQueueStatus(chat: number): { pending: number; processing: boolean } {
-  const pending = logQueue.get(chat)?.length || 0
-  const processing = logProcessing.get(chat) || false
-  return { pending, processing }
+  const pending = logQueue.filter(item => item.chat === chat).length
+  return { pending, processing: globalLogProcessing }
 }
 
 // Create a compressed preview for large images
@@ -104,7 +104,7 @@ async function createCompressedPreview(filePath: string, maxSize = 1280): Promis
   }
 }
 
-async function sendToLogChannel(chat: number, item: LogQueueItem) {
+async function sendToLogChannel(chat: number, item: Omit<LogQueueItem, 'chat'>) {
   if (!LOG_CHANNEL_ID) {
     item.resolve() // Resolve immediately if no log channel
     return
@@ -112,44 +112,61 @@ async function sendToLogChannel(chat: number, item: LogQueueItem) {
 
   log(`[Log] Adding to queue: ${item.url} (index ${item.index}) for chat ${chat}`)
 
-  // Add to queue
-  if (!logQueue.has(chat)) {
-    logQueue.set(chat, [])
-  }
-  const queue = logQueue.get(chat)!
-  queue.push(item)
-  queue.sort((a, b) => a.index - b.index) // Sort by index to maintain order
+  // Add to global queue
+  logQueue.push({ chat, ...item })
+  
+  // Sort by chat and index to maintain local order but process whatever is ready
+  logQueue.sort((a, b) => {
+    if (a.chat !== b.chat) return 0
+    return a.index - b.index
+  })
 
-  log(`[Log] Queue size for chat ${chat}: ${queue.length}`)
+  log(`[Log] Global Queue size: ${logQueue.length}`)
 
   // Start processing loop if not already running
-  if (!logProcessing.get(chat)) {
-    logProcessing.set(chat, true)
-    log(`[Log] Starting queue processor for chat ${chat}`)
+  if (!globalLogProcessing) {
+    globalLogProcessing = true
+    log(`[Log] Starting global log queue processor`)
     // Process queue in background
-    processLogQueue(chat).catch(e => log(`Log queue error: ${e.message}`))
+    processLogQueue().catch(e => log(`Log queue error: ${e.message}`))
   }
 }
 
-async function processLogQueue(chat: number) {
-  const queue = logQueue.get(chat)!
+async function processLogQueue() {
+  log(`[Log] Processing global log queue, length: ${logQueue.length}`)
 
-  log(`[Log] Processing queue for chat ${chat}, queue length: ${queue.length}`)
+  while (logQueue.length > 0) {
+    // Ensure sorted continuously
+    logQueue.sort((a, b) => {
+      if (a.chat !== b.chat) return 0
+      return a.index - b.index
+    })
 
-  while (queue.length > 0) {
+    const item = logQueue[0]
+    const chat = item.chat
 
+    // Check if batch was cancelled
+    const progressState = chatData[chat]?.batchProgress
+    if (progressState?.isCancelled) {
+      log(`[Log] Batch cancelled, removing item for chat ${chat}`)
+      logQueue.shift()
+      item.resolve()
+      // Clean up files
+      if (item.cleanupFilePath && fs.existsSync(item.cleanupFilePath)) {
+        try { fs.rmSync(item.cleanupFilePath) } catch (_) {}
+        if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
+          try { fs.rmdirSync(item.cleanupDir) } catch (_) {}
+        }
+      }
+      continue
+    }
 
-    // Sort queue by index to maintain order
-    queue.sort((a, b) => a.index - b.index)
-
-    const item = queue[0]
-
-    log(`[Log] Processing item: ${item.url} (index ${item.index})`)
+    log(`[Log] Processing item: ${item.url} (index ${item.index}) for chat ${chat}`)
 
     // Check if file still exists before processing
     if (!item.url.startsWith('tg-file-') && item.filePath && !fs.existsSync(item.filePath)) {
       log(`[Log] File no longer exists, skipping: ${item.filePath}`)
-      queue.shift()
+      logQueue.shift()
       item.resolve()
       continue
     }
@@ -451,7 +468,7 @@ async function processLogQueue(chat: number) {
       }
     }
 
-    queue.shift()
+    logQueue.shift()
     item.resolve()
 
     // Clean up file if this was a parallel-mode item
@@ -467,11 +484,11 @@ async function processLogQueue(chat: number) {
       }
     }
 
-    log(`[Log] Removed from queue: ${item.url}, remaining: ${queue.length}`)
+    log(`[Log] Removed from queue: ${item.url}, remaining: ${logQueue.length}`)
   }
 
-  logProcessing.set(chat, false)
-  log(`[Log] Queue processor stopped for chat ${chat}`)
+  globalLogProcessing = false
+  log(`[Log] Global Queue processor stopped`)
 }
 
 // Check if cache directory usage exceeds the limit
@@ -1056,54 +1073,29 @@ export async function transferSingleURL(
       isCached = true
     } else {
       let uploadRetries = 3
-      let uploadFrame = 0
-      const uploadInterval = setInterval(async () => {
-        uploadFrame++
-        const animPos = uploadFrame % 20
-        const bar = '░'.repeat(animPos) + '█' + '░'.repeat(19 - animPos)
-        const dots = '.'.repeat((uploadFrame % 3) + 1)
-
-        await bot
-          .editMessage(chat, {
-            message: statusMsgId,
-            text:
-              `<b>📥 Batch Upload</b>\n\n` +
-              `<b>📤 Uploading to ${service}${dots}</b>\n` +
-              `📁 Size: ${(finalFileSize / 1000 / 1000).toFixed(2)} MB\n` +
-              `<code>[${bar}]</code>`,
-            parseMode: 'html',
-            linkPreview: false,
-          })
-          .catch(() => {})
-      }, 2000)
-
-      try {
-        while (uploadRetries > 0) {
-          try {
-            if (service.toLowerCase() === 'catbox') {
-              const client = new Catbox(chatData[chat].token || CATBOX_TOKEN || '')
-              result = await client.uploadFile({ path: filePath })
-            } else {
-              const lbe = chatData[chat].lbe
-              const client = new Litterbox()
-              result = await client.upload({
-                path: filePath,
-                duration: `${lbe}h` as any,
-              })
-            }
-            break
-          } catch (e) {
-            uploadRetries--
-            if (uploadRetries > 0) {
-              log(`[${logIndex}] Upload failed, retrying... (${e.message})`)
-              await new Promise(resolve => setTimeout(resolve, 1500))
-            } else {
-              throw new Error(`Upload failed after retries: ${e.message}`)
-            }
+      while (uploadRetries > 0) {
+        try {
+          if (service.toLowerCase() === 'catbox') {
+            const client = new Catbox(chatData[chat].token || CATBOX_TOKEN || '')
+            result = await client.uploadFile({ path: filePath })
+          } else {
+            const lbe = chatData[chat].lbe
+            const client = new Litterbox()
+            result = await client.upload({
+              path: filePath,
+              duration: `${lbe}h` as any,
+            })
+          }
+          break
+        } catch (e) {
+          uploadRetries--
+          if (uploadRetries > 0) {
+            log(`[${logIndex}] Upload failed, retrying... (${e.message})`)
+            await new Promise(resolve => setTimeout(resolve, 1500))
+          } else {
+            throw new Error(`Upload failed after retries: ${e.message}`)
           }
         }
-      } finally {
-        clearInterval(uploadInterval)
       }
     }
 
