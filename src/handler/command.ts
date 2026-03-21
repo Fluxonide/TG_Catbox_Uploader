@@ -45,8 +45,17 @@ export async function handleCommand(msg: Api.Message) {
         const result = (ownerCmds as any)[command](arg)
         if (result instanceof Promise) await result
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error(`[Command Error] Command ${command} failed:`, e)
+      if (e.errorMessage === 'FLOOD' || e.name === 'FloodWaitError') {
+        console.warn(`[Command Warn] Stopping further command processing due to FloodWaitError of ${e.seconds}s`)
+        break
+      }
+    }
+    
+    // Add small delay to prevent rapid execution of multiple commands causing API flood
+    if (blocks.length > 1 && block !== blocks[blocks.length - 1]) {
+      await new Promise(r => setTimeout(r, 1500))
     }
   }
 }
@@ -256,11 +265,12 @@ class OwnerCommands {
               } catch (_) {}
             }
           }
-        } catch (e) {
+        } catch (e: any) {
+          if (e.errorMessage === 'FLOOD' || e.name === 'FloodWaitError') throw e;
           await bot.editMessage(this.chat, {
             message: statusMsg.id,
             text: `❌ Failed to download/upload: ${e.message}`,
-          })
+          }).catch(() => {})
         }
       } else {
         // If not a URL, send as text message (original behavior)
@@ -271,7 +281,8 @@ class OwnerCommands {
         })
         await bot.sendMessage(this.chat, { message: 'Message sent to log channel.' })
       }
-    } catch (e) {
+    } catch (e: any) {
+      if (e.errorMessage === 'FLOOD' || e.name === 'FloodWaitError') throw e;
       bot.sendMessage(this.chat, { message: `Failed to send: ${e.message}` }).catch(console.error)
     }
   }
@@ -755,11 +766,12 @@ class GeneralCommands {
 
       // Clean up progress state
       delete chatData[this.chat].batchProgress
-    } catch (error) {
+    } catch (error: any) {
+      if (error.errorMessage === 'FLOOD' || error.name === 'FloodWaitError') throw error;
       await bot.editMessage(this.chat, {
         message: statusMsg.id,
         text: `❌ Error downloading URL list: ${error.message}`,
-      })
+      }).catch(() => {})
     }
   }
 }
