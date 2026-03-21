@@ -44,13 +44,20 @@ if (process.env.PORT) {
 
   const server = http.createServer((req, res) => {
     if (req.url === '/' || req.url === '/health') {
+      const totalSeconds = process.uptime()
+      const days = Math.floor(totalSeconds / 86400)
+      const hours = Math.floor((totalSeconds % 86400) / 3600)
+      const minutes = Math.floor((totalSeconds % 3600) / 60)
+      const seconds = (totalSeconds % 60).toFixed(3)
+      const uptime = `${days} days ${hours} hours ${minutes} min ${seconds} s`
+
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(
         JSON.stringify({
           status: 'ok',
           bot: BOT_NAME,
           connected: bot.connected,
-          uptime: process.uptime(),
+          uptime,
         }),
       )
     } else {
