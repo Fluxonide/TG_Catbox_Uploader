@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "npx -y tsx index.ts",
-    "build": "tsc && cp src/i18n/*.json dist/src/i18n/",
+    "build": "tsc && node -e \"const fs=require('fs');fs.mkdirSync('dist/src/i18n',{recursive:true});fs.readdirSync('src/i18n').filter(f=>f.endsWith('.json')).forEach(f=>fs.copyFileSync('src/i18n/'+f,'dist/src/i18n/'+f))\"",
     "serve": "node dist/index.js"
   },
   "keywords": [
