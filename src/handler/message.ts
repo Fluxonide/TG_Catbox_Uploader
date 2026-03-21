@@ -121,11 +121,12 @@ async function handleTxtFileUrls(msg: any) {
 
     // Process the URLs
     await transferFromURL(syntheticMsg)
-  } catch (error) {
+  } catch (error: any) {
+    if (error.errorMessage === 'FLOOD' || error.name === 'FloodWaitError') throw error;
     await bot.editMessage(chatId, {
       message: statusMsg.id,
       text: `❌ Error processing file: ${error.message}`,
-    })
+    }).catch(() => {})
   }
 }
 
@@ -369,10 +370,11 @@ async function handleURLMessage(msg: any) {
 
     // Clean up progress state
     delete chatData[chat].batchProgress
-  } catch (error) {
+  } catch (error: any) {
+    if (error.errorMessage === 'FLOOD' || error.name === 'FloodWaitError') throw error;
     await bot.editMessage(chatId, {
       message: statusMsg.id,
       text: `❌ Error processing URLs: ${error.message}`,
-    })
+    }).catch(() => {})
   }
 }
