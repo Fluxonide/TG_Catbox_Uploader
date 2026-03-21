@@ -15,8 +15,8 @@ export async function handleCallbackQuery(event: CallbackQueryEvent) {
   const chat = query.userId.toJSNumber()
   const data = query.data?.toString() || ''
   const arg = data.includes('_') ? data.slice(data.indexOf('_') + 1) : null
-  let lang = chatData[chat].lang
   initChatData(chat)
+  let lang = chatData[chat].lang
 
   // Buttons, Text
   let bt: Api.KeyboardButtonCallback[][] = [],
