@@ -585,8 +585,9 @@ export async function transfer(msg: Api.Message) {
   }
 
   if (
-    (service === 'Catbox' && fileSize > 200000000) ||
-    (service === 'Litterbox' && fileSize > 1000000000)
+    !chatData[chat].skipCatbox &&
+    ((service === 'Catbox' && fileSize > 200000000) ||
+    (service === 'Litterbox' && fileSize > 1000000000))
   )
     return bot.sendMessage(chat, {
       message: i18n.t(lang, 'err_FileTooBig', [service]),
@@ -681,54 +682,65 @@ export async function transfer(msg: Api.Message) {
 
     log(`Downloaded: ${filePath} (Size ${fileSize})`)
 
-    // Animated upload progress indicator
-    let uploadFrame = 0
-    const uploadInterval = setInterval(() => {
-      uploadFrame++
-      const animPos = uploadFrame % 20
-      const bar = '░'.repeat(animPos) + '█' + '░'.repeat(19 - animPos)
-      const dots = '.'.repeat((uploadFrame % 3) + 1)
-      bot
-        .editMessage(chat, {
-          message: editMsg.id,
-          text:
-            `<b>📤 Uploading to ${service}${dots}</b>\n\n` +
-            `📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB\n` +
-            `<code>[${bar}]</code>`,
-          parseMode: 'html',
-        })
-        .catch(() => {})
-    }, 2000)
-
     // Upload to Catbox / Litterbox
-    let result: string
-    let validity: string
+    let result: string = 'Skipped'
+    let validity: string = 'N/A'
 
-    try {
-      if (service.toLowerCase() === 'catbox') {
-        validity = '∞'
-        const client = new Catbox(chatData[chat].token || CATBOX_TOKEN || '')
-        result = await client.uploadFile({ path: filePath })
-      } else {
-        const lbe = chatData[chat].lbe
-        const client = new Litterbox()
+    if (chatData[chat].skipCatbox) {
+      // Skip catbox upload — just update status
+      await bot.editMessage(chat, {
+        message: editMsg.id,
+        text: `<b>📤 Sending to log channel...</b>\n\n📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB`,
+        parseMode: 'html',
+      }).catch(() => {})
+    } else {
+      // Animated upload progress indicator
+      let uploadFrame = 0
+      const uploadInterval = setInterval(() => {
+        uploadFrame++
+        const animPos = uploadFrame % 20
+        const bar = '░'.repeat(animPos) + '█' + '░'.repeat(19 - animPos)
+        const dots = '.'.repeat((uploadFrame % 3) + 1)
+        bot
+          .editMessage(chat, {
+            message: editMsg.id,
+            text:
+              `<b>📤 Uploading to ${service}${dots}</b>\n\n` +
+              `📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB\n` +
+              `<code>[${bar}]</code>`,
+            parseMode: 'html',
+          })
+          .catch(() => {})
+      }, 2000)
 
-        validity = `${lbe} ${i18n.t(lang, lbe === 1 ? 'hour' : 'hours')}`
-        result = await client.upload({
-          path: filePath,
-          duration: `${validity}h` as any,
-        })
+      try {
+        if (service.toLowerCase() === 'catbox') {
+          validity = '∞'
+          const client = new Catbox(chatData[chat].token || CATBOX_TOKEN || '')
+          result = await client.uploadFile({ path: filePath })
+        } else {
+          const lbe = chatData[chat].lbe
+          const client = new Litterbox()
+
+          validity = `${lbe} ${i18n.t(lang, lbe === 1 ? 'hour' : 'hours')}`
+          result = await client.upload({
+            path: filePath,
+            duration: `${validity}h` as any,
+          })
+        }
+      } finally {
+        clearInterval(uploadInterval)
       }
-    } finally {
-      clearInterval(uploadInterval)
     }
-    const text = i18n.t(lang, 'uploaded', [
-      service,
-      (fileSize / 1000 / 1000).toFixed(2),
-      validity,
-      result,
-      BOT_NAME,
-    ])
+    const text = chatData[chat].skipCatbox ? 
+      `<b>✅ Downloaded successfully!</b>\n\n📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB\n⚠️ Catbox uploading was skipped.` :
+      i18n.t(lang, 'uploaded', [
+        service,
+        (fileSize / 1000 / 1000).toFixed(2),
+        validity,
+        result,
+        BOT_NAME,
+      ])
     try {
       await bot.sendMessage(chat, {
         message: text,
@@ -935,8 +947,8 @@ export async function transferSingleURL(
     const contentLength = response.headers.get('content-length')
     const fileSize = contentLength ? parseInt(contentLength) : 0
 
-    // Check file size limits
-    if (fileSize > 0) {
+    // Check file size limits (only when catbox upload is enabled)
+    if (fileSize > 0 && !chatData[chat].skipCatbox) {
       if (
         (service === 'Catbox' && fileSize > 200000000) ||
         (service === 'Litterbox' && fileSize > 1000000000)
@@ -1029,10 +1041,11 @@ export async function transferSingleURL(
     const finalFileSize = fs.statSync(filePath).size
     log(`[${logIndex}] Downloaded from URL: ${filePath} (Size ${finalFileSize})`)
 
-    // Check final file size
+    // Check final file size (only when catbox upload is enabled)
     if (
-      (service === 'Catbox' && finalFileSize > 200000000) ||
-      (service === 'Litterbox' && finalFileSize > 1000000000)
+      !chatData[chat].skipCatbox &&
+      ((service === 'Catbox' && finalFileSize > 200000000) ||
+      (service === 'Litterbox' && finalFileSize > 1000000000))
     ) {
       log(`[${logIndex}] Final file too big: ${filePath} (${finalFileSize} bytes)`)
       if (LOG_CHANNEL_ID) {
@@ -1067,7 +1080,10 @@ export async function transferSingleURL(
       throw new Error('Cancelled')
     }
 
-    if (cachedCatboxUrl) {
+    if (chatData[chat].skipCatbox) {
+      log(`[${logIndex}] URL upload skipped due to user settings: ${url}`)
+      result = 'Skipped'
+    } else if (cachedCatboxUrl) {
       log(`[${logIndex}] URL already uploaded, using cache: ${url} -> ${cachedCatboxUrl}`)
       result = cachedCatboxUrl
       isCached = true
@@ -1099,13 +1115,15 @@ export async function transferSingleURL(
       }
     }
 
-    const resultLine = `<code>${logIndex}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB</a>`
+    const resultLine = chatData[chat].skipCatbox ? 
+      `<code>${logIndex}.</code> Skipped upload (${(finalFileSize / 1000 / 1000).toFixed(2)} MB)` :
+      `<code>${logIndex}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB</a>`
 
     chatData[chat].total++
     log(`[${logIndex}] Processed ${filePath} from URL for ${service}: ${result}`)
 
     // Save to cache for deduplication
-    if (!isCached) setCachedUrl(url, result)
+    if (!isCached && !chatData[chat].skipCatbox) setCachedUrl(url, result)
 
     // Ensure bot is connected before sending to log
     if (LOG_CHANNEL_ID && !bot.connected) {
