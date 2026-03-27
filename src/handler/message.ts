@@ -156,7 +156,7 @@ async function handleURLMessage(msg: any) {
 
   try {
     // Import transfer function
-    const { transferSingleURL, getLogQueueStatus } = await import('./transfer.js')
+    const { transferSingleURL, getLogQueueStatus, isFloodPaused } = await import('./transfer.js')
 
     let completed = 0
     let failed = 0
@@ -276,12 +276,12 @@ async function handleURLMessage(msg: any) {
         .catch(() => {})
     }
 
-    // Auto-update progress every 5 seconds
+    // Auto-update progress every 10 seconds (reduced from 5s to avoid flood)
     const progressInterval = setInterval(() => {
-      if (!progressState.isComplete) {
+      if (!progressState.isComplete && !isFloodPaused()) {
         updateProgress().catch(() => {})
       }
-    }, 5000)
+    }, 10000)
 
     // Process URLs one by one sequentially
     for (let i = 0; i < urls.length; i++) {

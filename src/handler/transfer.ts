@@ -21,6 +21,66 @@ import {
 } from '../env.js'
 import type { Api } from 'telegram'
 
+// ─── Global Flood Gate ───────────────────────────────────────────────────────
+// When ANY Telegram API call triggers a FloodWaitError, ALL outgoing calls
+// must pause until the flood penalty expires. This prevents cascading penalties
+// that escalate to 7600s+ bans.
+let floodPauseUntil = 0
+
+/**
+ * Extract flood wait seconds from various error formats.
+ * Returns the wait duration in seconds, or null if not a flood error.
+ */
+export function getFloodWaitSeconds(e: any): number | null {
+  if (!e) return null
+  // gramjs FloodWaitError has .seconds
+  if (e.seconds && (e.errorMessage === 'FLOOD' || e.name === 'FloodWaitError')) {
+    return e.seconds
+  }
+  // Check error message for flood mentions
+  if (typeof e.message === 'string') {
+    if (e.message.includes('Flood')) {
+      // Try to extract seconds from message like "Sleeping for 30s on flood wait"
+      const match = e.message.match(/(\d+)s?\s*(?:on\s+)?flood/i) ||
+                    e.message.match(/flood.*?(\d+)/i)
+      return match ? parseInt(match[1]) : 30 // default 30s if we can't parse
+    }
+  }
+  if (e.errorMessage === 'FLOOD') return e.seconds || 30
+  return null
+}
+
+/**
+ * Set a global flood pause. ALL API calls will wait until this expires.
+ */
+export function setFloodPause(seconds: number) {
+  const pauseUntil = Date.now() + (seconds * 1000) + 2000 // extra 2s safety buffer
+  if (pauseUntil > floodPauseUntil) {
+    floodPauseUntil = pauseUntil
+    log(`[FloodGate] ⚠️ Flood detected! Pausing ALL API calls for ${seconds + 2}s`)
+  }
+}
+
+/**
+ * Wait until the global flood gate allows API calls.
+ * Must be called before every Telegram API call.
+ */
+export async function waitForFloodGate(): Promise<void> {
+  const now = Date.now()
+  if (floodPauseUntil > now) {
+    const waitMs = floodPauseUntil - now
+    log(`[FloodGate] Waiting ${Math.ceil(waitMs / 1000)}s before next API call...`)
+    await new Promise(resolve => setTimeout(resolve, waitMs))
+  }
+}
+
+/**
+ * Check if we are currently in a flood pause.
+ */
+export function isFloodPaused(): boolean {
+  return Date.now() < floodPauseUntil
+}
+
 // Queue for ordered log channel messages
 interface LogQueueItem {
   chat: number
@@ -151,7 +211,6 @@ async function processLogQueue() {
       log(`[Log] Batch cancelled, removing item for chat ${chat}`)
       logQueue.shift()
       item.resolve()
-      // Clean up files
       if (item.cleanupFilePath && fs.existsSync(item.cleanupFilePath)) {
         try { fs.rmSync(item.cleanupFilePath) } catch (_) {}
         if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
@@ -163,7 +222,6 @@ async function processLogQueue() {
 
     log(`[Log] Processing item: ${item.url} (index ${item.index}) for chat ${chat}`)
 
-    // Check if file still exists before processing
     if (!item.url.startsWith('tg-file-') && item.filePath && !fs.existsSync(item.filePath)) {
       log(`[Log] File no longer exists, skipping: ${item.filePath}`)
       logQueue.shift()
@@ -171,36 +229,54 @@ async function processLogQueue() {
       continue
     }
 
+    // ── Wait for any active flood pause before processing this item ──
+    await waitForFloodGate()
+
     try {
       if (item.url.startsWith('tg-file-') && item.imageMsg) {
         // Direct media upload: forward the original message
         let fwdMsg: Api.Message | null = null
+        await waitForFloodGate()
         const fwdResult = await bot
           .forwardMessages(LOG_CHANNEL_ID, {
             messages: item.imageMsg.id,
             fromPeer: chat,
           })
-          .catch(() => null)
+          .catch((e) => {
+            const floodSec = getFloodWaitSeconds(e)
+            if (floodSec) setFloodPause(floodSec)
+            return null
+          })
         if (fwdResult && fwdResult.length > 0) {
           fwdMsg = fwdResult[0] as Api.Message
         }
 
         if (fwdMsg) {
+          await waitForFloodGate()
+          await new Promise(resolve => setTimeout(resolve, 2000))
           await bot
             .sendMessage(LOG_CHANNEL_ID, {
               message: `Service: ${item.service}\nResult: \`${item.result}\``,
               replyTo: fwdMsg.id,
             })
-            .catch(() => null)
+            .catch((e) => {
+              const floodSec = getFloodWaitSeconds(e)
+              if (floodSec) setFloodPause(floodSec)
+            })
 
           if (item.filePath && fs.existsSync(item.filePath)) {
+            await waitForFloodGate()
+            await new Promise(resolve => setTimeout(resolve, 2000))
             await bot
               .sendFile(LOG_CHANNEL_ID, {
                 file: item.filePath,
                 forceDocument: true,
                 replyTo: fwdMsg.id,
               })
-              .catch(() => null)
+              .catch((e) => {
+                const floodSec = getFloodWaitSeconds(e)
+                if (floodSec) setFloodPause(floodSec)
+              })
           }
         }
       } else {
@@ -220,18 +296,17 @@ async function processLogQueue() {
             let previewPath: string | null = null
             let imageMsg: Api.Message | null = null
 
-            // Always create compressed preview for all images
             if (/\.(jpg|jpeg|png|webp)$/i.test(item.filePath)) {
               log(`[Log] Creating compressed preview...`)
               previewPath = await createCompressedPreview(item.filePath)
             }
 
-            // Try to send preview (or original if small) as compressed photo
             const fileToSend = previewPath || item.filePath
             let uploadRetries = 3
-            let retryDelay = 2000
+            let retryDelay = 3000
 
             while (uploadRetries > 0 && !imageMsg) {
+              await waitForFloodGate()
               imageMsg = (await Promise.race([
                 bot.sendFile(LOG_CHANNEL_ID, {
                   file: fileToSend,
@@ -244,16 +319,20 @@ async function processLogQueue() {
                 ),
               ]).catch(e => {
                 log(`[Log] Failed to send compressed photo: ${e.message}`)
+                const floodSec = getFloodWaitSeconds(e)
+                if (floodSec) {
+                  setFloodPause(floodSec)
+                  return null
+                }
                 if (
                   e.message.includes('AUTH_KEY_DUPLICATED') ||
                   e.message.includes('timeout') ||
                   e.message.includes('ECONNRESET') ||
-                  e.message.includes('RPC_CALL_FAIL') ||
-                  e.message.includes('Flood')
+                  e.message.includes('RPC_CALL_FAIL')
                 ) {
-                  return null // Indicates transient error, allow retry
+                  return null
                 }
-                uploadRetries = 0 // Fatal error, don't retry photo upload
+                uploadRetries = 0
                 return null
               })) as Api.Message | null
 
@@ -267,7 +346,6 @@ async function processLogQueue() {
               }
             }
 
-            // If compressed photo failed, create smaller preview and retry
             if (!imageMsg && previewPath) {
               log(`[Log] Creating smaller preview (1024px)...`)
               if (fs.existsSync(previewPath)) fs.rmSync(previewPath)
@@ -275,8 +353,9 @@ async function processLogQueue() {
 
               if (previewPath) {
                 uploadRetries = 3
-                retryDelay = 2000
+                retryDelay = 3000
                 while (uploadRetries > 0 && !imageMsg) {
+                  await waitForFloodGate()
                   imageMsg = (await Promise.race([
                     bot.sendFile(LOG_CHANNEL_ID, {
                       file: previewPath,
@@ -289,19 +368,23 @@ async function processLogQueue() {
                     ),
                   ]).catch(e => {
                     log(`[Log] Failed to send smaller preview: ${e.message}`)
+                    const floodSec = getFloodWaitSeconds(e)
+                    if (floodSec) {
+                      setFloodPause(floodSec)
+                      return null
+                    }
                     if (
                       e.message.includes('AUTH_KEY_DUPLICATED') ||
                       e.message.includes('timeout') ||
                       e.message.includes('ECONNRESET') ||
-                      e.message.includes('RPC_CALL_FAIL') ||
-                      e.message.includes('Flood')
+                      e.message.includes('RPC_CALL_FAIL')
                     ) {
                       return null
                     }
                     uploadRetries = 0
                     return null
                   })) as Api.Message | null
-                  
+
                   if (!imageMsg && uploadRetries > 0) {
                     uploadRetries--
                     if (uploadRetries > 0) {
@@ -314,12 +397,12 @@ async function processLogQueue() {
               }
             }
 
-            // Last resort: send as document
             if (!imageMsg) {
               log(`[Log] Sending as document (fallback)...`)
               uploadRetries = 3
-              retryDelay = 2000
+              retryDelay = 3000
               while (uploadRetries > 0 && !imageMsg) {
+                await waitForFloodGate()
                 imageMsg = (await Promise.race([
                   bot.sendFile(LOG_CHANNEL_ID, {
                     file: fileToSend,
@@ -332,12 +415,16 @@ async function processLogQueue() {
                   ),
                 ]).catch(e => {
                   log(`[Log] Failed to send as document: ${e.message}`)
+                  const floodSec = getFloodWaitSeconds(e)
+                  if (floodSec) {
+                    setFloodPause(floodSec)
+                    return null
+                  }
                   if (
                     e.message.includes('AUTH_KEY_DUPLICATED') ||
                     e.message.includes('timeout') ||
                     e.message.includes('ECONNRESET') ||
-                    e.message.includes('RPC_CALL_FAIL') ||
-                    e.message.includes('Flood')
+                    e.message.includes('RPC_CALL_FAIL')
                   ) {
                     return null
                   }
@@ -357,11 +444,11 @@ async function processLogQueue() {
             }
 
             if (imageMsg) {
-              // Always send original file as document reply
-              // Rename file to match catbox URL filename if available
+              // Delay between preview and document to avoid flood
+              await new Promise(resolve => setTimeout(resolve, 2000))
               let docFilePath = item.filePath
               let renamedPath: string | null = null
-              if (item.result) {
+              if (item.result && item.result !== 'Skipped') {
                 try {
                   const catboxFilename = new URL(item.result).pathname.split('/').pop()
                   if (catboxFilename) {
@@ -374,15 +461,14 @@ async function processLogQueue() {
                       renamedPath = null
                     }
                   }
-                } catch (_) {
-                  // Fallback to original path
-                }
+                } catch (_) {}
               }
               let docRetries = 3
-              let docRetryDelay = 2000
+              let docRetryDelay = 3000
               let docSent = false
-              
+
               while (docRetries > 0 && !docSent) {
+                await waitForFloodGate()
                 await Promise.race([
                   bot.sendFile(LOG_CHANNEL_ID, {
                     file: docFilePath,
@@ -396,91 +482,97 @@ async function processLogQueue() {
                   docSent = true
                 }).catch(async e => {
                   log(`[Log] Failed to send raw document: ${e.message}`)
-                  if (
+                  const floodSec = getFloodWaitSeconds(e)
+                  if (floodSec) {
+                    setFloodPause(floodSec)
+                    docRetries--
+                  } else if (
                     e.message.includes('AUTH_KEY_DUPLICATED') ||
                     e.message.includes('timeout') ||
                     e.message.includes('ECONNRESET') ||
-                    e.message.includes('RPC_CALL_FAIL') ||
-                    e.message.includes('Flood')
+                    e.message.includes('RPC_CALL_FAIL')
                   ) {
                     docRetries--
                     if (docRetries > 0) {
-                      log(`[Log] Retrying original document reply... (${docRetries} left)`)
                       await new Promise(resolve => setTimeout(resolve, docRetryDelay))
                       docRetryDelay *= 2
                     }
                   } else {
-                    docRetries = 0 // fatal
+                    docRetries = 0
                   }
                 })
               }
-              // Clean up renamed file
               if (renamedPath && renamedPath !== item.filePath && fs.existsSync(renamedPath)) {
-                try {
-                  fs.rmSync(renamedPath)
-                } catch (_) {}
+                try { fs.rmSync(renamedPath) } catch (_) {}
               }
             } else {
-              // Fallback: send just the caption if file upload failed
               log(`[Log] File upload failed, sending caption only`)
+              await waitForFloodGate()
               await bot
                 .sendMessage(LOG_CHANNEL_ID, {
                   message: captionStr + `\n\n⚠️ File upload failed (${fileSizeMB} MB)`,
                 })
-                .catch(() => null)
+                .catch((e) => {
+                  const floodSec = getFloodWaitSeconds(e)
+                  if (floodSec) setFloodPause(floodSec)
+                })
             }
 
-            // Clean up preview file
             if (previewPath && fs.existsSync(previewPath)) {
               fs.rmSync(previewPath)
             }
           } catch (e) {
             log(`[Log] Error uploading to log channel: ${e.message}`)
-            // Send caption only as fallback
-            await bot
-              .sendMessage(LOG_CHANNEL_ID, {
-                message: captionStr + `\n\n⚠️ File upload error: ${e.message}`,
-              })
-              .catch(() => null)
+            const floodSec = getFloodWaitSeconds(e)
+            if (floodSec) setFloodPause(floodSec)
+            if (!floodSec) {
+              await waitForFloodGate()
+              await bot
+                .sendMessage(LOG_CHANNEL_ID, {
+                  message: captionStr + `\n\n⚠️ File upload error: ${e.message}`,
+                })
+                .catch(() => null)
+            }
           }
         } else {
-          // File missing (e.g. it was too big to download), just send text
-          await bot.sendMessage(LOG_CHANNEL_ID, { message: captionStr }).catch(() => null)
+          await waitForFloodGate()
+          await bot.sendMessage(LOG_CHANNEL_ID, { message: captionStr }).catch((e) => {
+            const floodSec = getFloodWaitSeconds(e)
+            if (floodSec) setFloodPause(floodSec)
+          })
         }
       }
 
       log(`[Log] Successfully sent to log channel: ${item.url}`)
 
-      // Delay to avoid AUTH_KEY_DUPLICATED errors (reduced for faster processing)
-      const delayMs = 2000 // 2 seconds between log uploads
-      await new Promise(resolve => setTimeout(resolve, delayMs))
+      // Delay between log items to avoid flood (each item sends 2-3 API calls)
+      await new Promise(resolve => setTimeout(resolve, 4000))
     } catch (e) {
       log(`Failed to send to log channel: ${e.message || e}`)
-      // Try to send at least a text message as fallback
-      try {
-        await bot
-          .sendMessage(LOG_CHANNEL_ID, {
-            message: `Source: \`${item.url}\`\nService: ${item.service}\nResult: \`${item.result}\`\n\n⚠️ Error: ${e.message || e}`,
-          })
-          .catch(() => null)
-      } catch (_) {
-        // Ignore if even text message fails
+      const floodSec = getFloodWaitSeconds(e)
+      if (floodSec) setFloodPause(floodSec)
+      if (!floodSec) {
+        try {
+          await waitForFloodGate()
+          await bot
+            .sendMessage(LOG_CHANNEL_ID, {
+              message: `Source: \`${item.url}\`\nService: ${item.service}\nResult: \`${item.result}\`\n\n⚠️ Error: ${e.message || e}`,
+            })
+            .catch(() => null)
+        } catch (_) {}
       }
     }
 
     logQueue.shift()
     item.resolve()
 
-    // Clean up file if this was a parallel-mode item
     if (item.cleanupFilePath && fs.existsSync(item.cleanupFilePath)) {
       try {
         fs.rmSync(item.cleanupFilePath)
         log(`[Log] Cleaned up file: ${item.cleanupFilePath}`)
       } catch (_) {}
       if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
-        try {
-          fs.rmdirSync(item.cleanupDir)
-        } catch (_) {}
+        try { fs.rmdirSync(item.cleanupDir) } catch (_) {}
       }
     }
 
@@ -490,6 +582,8 @@ async function processLogQueue() {
   globalLogProcessing = false
   log(`[Log] Global Queue processor stopped`)
 }
+
+
 
 // Check if cache directory usage exceeds the limit
 function getCacheSizeMB(): number {
@@ -653,8 +747,8 @@ export async function transfer(msg: Api.Message) {
       downloadedChunks += chunksToDownload
 
       const now = Date.now()
-      // Update the progress message every 3 seconds
-      if (downloadedBytes && now - lastEditTime > 3000) {
+      // Update the progress message every 5 seconds
+      if (downloadedBytes && now - lastEditTime > 5000) {
         // Convert to MB
         const downloaded = +(downloadedBytes / 1000 / 1000).toFixed(2)
         const total = +(fileSize / 1000 / 1000).toFixed(2)
@@ -694,9 +788,10 @@ export async function transfer(msg: Api.Message) {
         parseMode: 'html',
       }).catch(() => {})
     } else {
-      // Animated upload progress indicator
+      // Animated upload progress indicator (every 5s to reduce API calls)
       let uploadFrame = 0
       const uploadInterval = setInterval(() => {
+        if (isFloodPaused()) return // Skip animation during flood pause
         uploadFrame++
         const animPos = uploadFrame % 20
         const bar = '░'.repeat(animPos) + '█' + '░'.repeat(19 - animPos)
@@ -711,7 +806,7 @@ export async function transfer(msg: Api.Message) {
             parseMode: 'html',
           })
           .catch(() => {})
-      }, 2000)
+      }, 5000)
 
       try {
         if (service.toLowerCase() === 'catbox') {
@@ -1219,15 +1314,22 @@ async function sendFailedToLogChannel(
 ) {
   if (!LOG_CHANNEL_ID) return
   try {
+    await waitForFloodGate()
     await bot
       .sendMessage(LOG_CHANNEL_ID, {
         message: `❌ <b>Failed Upload</b>\nFrom: <code>${chat}</code>\nURL: <code>${url}</code>\nService: ${service}\nError: <code>${error}</code>\nIndex: ${index}`,
         parseMode: 'html',
       })
-      .catch(() => null)
+      .catch((e) => {
+        const floodSec = getFloodWaitSeconds(e)
+        if (floodSec) setFloodPause(floodSec)
+      })
     // Add delay to avoid flood
-    await new Promise(resolve => setTimeout(resolve, 1500))
+    await new Promise(resolve => setTimeout(resolve, 2000))
   } catch (e) {
+    const floodSec = getFloodWaitSeconds(e)
+    if (floodSec) setFloodPause(floodSec)
     log(`Failed to send error log to channel: ${e.message}`)
   }
 }
+
