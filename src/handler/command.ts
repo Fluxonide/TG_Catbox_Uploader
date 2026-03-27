@@ -397,6 +397,22 @@ class GeneralCommands {
     }
   }
 
+  async skipcat() {
+    chatData[this.chat].skipCatbox = true
+    await bot.sendMessage(this.chat, {
+      message: '✅ Catbox uploading will be skipped. Files will only be saved to the log channel.',
+      parseMode: 'html',
+    })
+  }
+
+  async upcat() {
+    chatData[this.chat].skipCatbox = false
+    await bot.sendMessage(this.chat, {
+      message: '✅ Catbox uploading has been re-enabled.',
+      parseMode: 'html',
+    })
+  }
+
   async cancel() {
     const progressState = chatData[this.chat].batchProgress
 
