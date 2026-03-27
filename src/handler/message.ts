@@ -276,12 +276,12 @@ async function handleURLMessage(msg: any) {
         .catch(() => {})
     }
 
-    // Auto-update progress every 10 seconds (reduced from 5s to avoid flood)
+    // Auto-update progress every 7 seconds (skipped during flood pause)
     const progressInterval = setInterval(() => {
       if (!progressState.isComplete && !isFloodPaused()) {
         updateProgress().catch(() => {})
       }
-    }, 10000)
+    }, 7000)
 
     // Process URLs one by one sequentially
     for (let i = 0; i < urls.length; i++) {

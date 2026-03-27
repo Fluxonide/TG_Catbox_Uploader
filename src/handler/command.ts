@@ -652,12 +652,12 @@ class GeneralCommands {
           .catch(() => {})
       }
 
-      // Auto-update progress every 10 seconds (reduced from 5s to avoid flood)
+      // Auto-update progress every 7 seconds (skipped during flood pause)
       const progressInterval = setInterval(() => {
         if (!progressState.isComplete && !isFloodPaused()) {
           updateProgress().catch(() => {})
         }
-      }, 10000)
+      }, 7000)
 
       // Process URLs with controlled concurrency (worker pool pattern)
       let nextIndex = 0 // Shared counter for the next URL to process

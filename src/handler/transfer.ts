@@ -42,7 +42,7 @@ export function getFloodWaitSeconds(e: any): number | null {
     if (e.message.includes('Flood')) {
       // Try to extract seconds from message like "Sleeping for 30s on flood wait"
       const match = e.message.match(/(\d+)s?\s*(?:on\s+)?flood/i) ||
-                    e.message.match(/flood.*?(\d+)/i)
+        e.message.match(/flood.*?(\d+)/i)
       return match ? parseInt(match[1]) : 30 // default 30s if we can't parse
     }
   }
@@ -174,7 +174,7 @@ async function sendToLogChannel(chat: number, item: Omit<LogQueueItem, 'chat'>) 
 
   // Add to global queue
   logQueue.push({ chat, ...item })
-  
+
   // Sort by chat and index to maintain local order but process whatever is ready
   logQueue.sort((a, b) => {
     if (a.chat !== b.chat) return 0
@@ -212,9 +212,9 @@ async function processLogQueue() {
       logQueue.shift()
       item.resolve()
       if (item.cleanupFilePath && fs.existsSync(item.cleanupFilePath)) {
-        try { fs.rmSync(item.cleanupFilePath) } catch (_) {}
+        try { fs.rmSync(item.cleanupFilePath) } catch (_) { }
         if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
-          try { fs.rmdirSync(item.cleanupDir) } catch (_) {}
+          try { fs.rmdirSync(item.cleanupDir) } catch (_) { }
         }
       }
       continue
@@ -253,7 +253,7 @@ async function processLogQueue() {
 
         if (fwdMsg) {
           await waitForFloodGate()
-          await new Promise(resolve => setTimeout(resolve, 2000))
+          await new Promise(resolve => setTimeout(resolve, 1500))
           await bot
             .sendMessage(LOG_CHANNEL_ID, {
               message: `Service: ${item.service}\nResult: \`${item.result}\``,
@@ -266,7 +266,7 @@ async function processLogQueue() {
 
           if (item.filePath && fs.existsSync(item.filePath)) {
             await waitForFloodGate()
-            await new Promise(resolve => setTimeout(resolve, 2000))
+            await new Promise(resolve => setTimeout(resolve, 1000))
             await bot
               .sendFile(LOG_CHANNEL_ID, {
                 file: item.filePath,
@@ -303,7 +303,7 @@ async function processLogQueue() {
 
             const fileToSend = previewPath || item.filePath
             let uploadRetries = 3
-            let retryDelay = 3000
+            let retryDelay = 2000
 
             while (uploadRetries > 0 && !imageMsg) {
               await waitForFloodGate()
@@ -353,7 +353,7 @@ async function processLogQueue() {
 
               if (previewPath) {
                 uploadRetries = 3
-                retryDelay = 3000
+                retryDelay = 2000
                 while (uploadRetries > 0 && !imageMsg) {
                   await waitForFloodGate()
                   imageMsg = (await Promise.race([
@@ -400,7 +400,7 @@ async function processLogQueue() {
             if (!imageMsg) {
               log(`[Log] Sending as document (fallback)...`)
               uploadRetries = 3
-              retryDelay = 3000
+              retryDelay = 2000
               while (uploadRetries > 0 && !imageMsg) {
                 await waitForFloodGate()
                 imageMsg = (await Promise.race([
@@ -445,7 +445,7 @@ async function processLogQueue() {
 
             if (imageMsg) {
               // Delay between preview and document to avoid flood
-              await new Promise(resolve => setTimeout(resolve, 2000))
+              await new Promise(resolve => setTimeout(resolve, 1500))
               let docFilePath = item.filePath
               let renamedPath: string | null = null
               if (item.result && item.result !== 'Skipped') {
@@ -461,10 +461,10 @@ async function processLogQueue() {
                       renamedPath = null
                     }
                   }
-                } catch (_) {}
+                } catch (_) { }
               }
               let docRetries = 3
-              let docRetryDelay = 3000
+              let docRetryDelay = 2000
               let docSent = false
 
               while (docRetries > 0 && !docSent) {
@@ -503,7 +503,7 @@ async function processLogQueue() {
                 })
               }
               if (renamedPath && renamedPath !== item.filePath && fs.existsSync(renamedPath)) {
-                try { fs.rmSync(renamedPath) } catch (_) {}
+                try { fs.rmSync(renamedPath) } catch (_) { }
               }
             } else {
               log(`[Log] File upload failed, sending caption only`)
@@ -545,8 +545,8 @@ async function processLogQueue() {
 
       log(`[Log] Successfully sent to log channel: ${item.url}`)
 
-      // Delay between log items to avoid flood (each item sends 2-3 API calls)
-      await new Promise(resolve => setTimeout(resolve, 4000))
+      // Delay between log items (flood gate handles emergencies, this is just spacing)
+      await new Promise(resolve => setTimeout(resolve, 2500))
     } catch (e) {
       log(`Failed to send to log channel: ${e.message || e}`)
       const floodSec = getFloodWaitSeconds(e)
@@ -559,7 +559,7 @@ async function processLogQueue() {
               message: `Source: \`${item.url}\`\nService: ${item.service}\nResult: \`${item.result}\`\n\n⚠️ Error: ${e.message || e}`,
             })
             .catch(() => null)
-        } catch (_) {}
+        } catch (_) { }
       }
     }
 
@@ -570,9 +570,9 @@ async function processLogQueue() {
       try {
         fs.rmSync(item.cleanupFilePath)
         log(`[Log] Cleaned up file: ${item.cleanupFilePath}`)
-      } catch (_) {}
+      } catch (_) { }
       if (item.cleanupDir && item.cleanupDir !== './cache' && fs.existsSync(item.cleanupDir)) {
-        try { fs.rmdirSync(item.cleanupDir) } catch (_) {}
+        try { fs.rmdirSync(item.cleanupDir) } catch (_) { }
       }
     }
 
@@ -603,9 +603,9 @@ function getCacheSizeMB(): number {
           const subPath = `${itemPath}/${subItem}`
           try {
             totalBytes += fs.statSync(subPath).size
-          } catch (_) {}
+          } catch (_) { }
         }
-      } catch (_) {}
+      } catch (_) { }
     }
   }
   return totalBytes / (1024 * 1024)
@@ -681,7 +681,7 @@ export async function transfer(msg: Api.Message) {
   if (
     !chatData[chat].skipCatbox &&
     ((service === 'Catbox' && fileSize > 200000000) ||
-    (service === 'Litterbox' && fileSize > 1000000000))
+      (service === 'Litterbox' && fileSize > 1000000000))
   )
     return bot.sendMessage(chat, {
       message: i18n.t(lang, 'err_FileTooBig', [service]),
@@ -748,7 +748,7 @@ export async function transfer(msg: Api.Message) {
 
       const now = Date.now()
       // Update the progress message every 5 seconds
-      if (downloadedBytes && now - lastEditTime > 5000) {
+      if (downloadedBytes && now - lastEditTime > 4000) {
         // Convert to MB
         const downloaded = +(downloadedBytes / 1000 / 1000).toFixed(2)
         const total = +(fileSize / 1000 / 1000).toFixed(2)
@@ -770,7 +770,7 @@ export async function transfer(msg: Api.Message) {
             text: text,
             parseMode: 'html',
           })
-          .catch(() => {})
+          .catch(() => { })
       }
     }
 
@@ -786,9 +786,9 @@ export async function transfer(msg: Api.Message) {
         message: editMsg.id,
         text: `<b>📤 Sending to log channel...</b>\n\n📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB`,
         parseMode: 'html',
-      }).catch(() => {})
+      }).catch(() => { })
     } else {
-      // Animated upload progress indicator (every 5s to reduce API calls)
+      // Animated upload progress indicator (every 3s, skipped during flood pause)
       let uploadFrame = 0
       const uploadInterval = setInterval(() => {
         if (isFloodPaused()) return // Skip animation during flood pause
@@ -805,8 +805,8 @@ export async function transfer(msg: Api.Message) {
               `<code>[${bar}]</code>`,
             parseMode: 'html',
           })
-          .catch(() => {})
-      }, 5000)
+          .catch(() => { })
+      }, 3000)
 
       try {
         if (service.toLowerCase() === 'catbox') {
@@ -827,7 +827,7 @@ export async function transfer(msg: Api.Message) {
         clearInterval(uploadInterval)
       }
     }
-    const text = chatData[chat].skipCatbox ? 
+    const text = chatData[chat].skipCatbox ?
       `<b>✅ Downloaded successfully!</b>\n\n📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB\n⚠️ Catbox uploading was skipped.` :
       i18n.t(lang, 'uploaded', [
         service,
@@ -887,7 +887,7 @@ export async function transfer(msg: Api.Message) {
         message: i18n.t(lang, 'error') + `\n\nError info: ${e.message}`,
         replyTo: msg.id,
       })
-      .catch(() => {})
+      .catch(() => { })
     log(`Download ${filePath} failed: ${e.stack}`)
   } finally {
     if (fs.existsSync(filePath)) fs.rmSync(filePath)
@@ -1119,7 +1119,7 @@ export async function transferSingleURL(
       if (done) {
         break
       }
-      
+
       // Await write stream to ensure data is actually flushed to disk
       if (!fileStream.write(value)) {
         await new Promise<void>(resolve => fileStream.once('drain', () => resolve()))
@@ -1140,7 +1140,7 @@ export async function transferSingleURL(
     if (
       !chatData[chat].skipCatbox &&
       ((service === 'Catbox' && finalFileSize > 200000000) ||
-      (service === 'Litterbox' && finalFileSize > 1000000000))
+        (service === 'Litterbox' && finalFileSize > 1000000000))
     ) {
       log(`[${logIndex}] Final file too big: ${filePath} (${finalFileSize} bytes)`)
       if (LOG_CHANNEL_ID) {
@@ -1210,7 +1210,7 @@ export async function transferSingleURL(
       }
     }
 
-    const resultLine = chatData[chat].skipCatbox ? 
+    const resultLine = chatData[chat].skipCatbox ?
       `<code>${logIndex}.</code> Skipped upload (${(finalFileSize / 1000 / 1000).toFixed(2)} MB)` :
       `<code>${logIndex}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB</a>`
 
@@ -1258,11 +1258,11 @@ export async function transferSingleURL(
         if (filePath && fs.existsSync(filePath)) {
           try {
             fs.rmSync(filePath)
-          } catch (_) {}
+          } catch (_) { }
           if (fileDir && fileDir !== './cache' && fs.existsSync(fileDir)) {
             try {
               fs.rmdirSync(fileDir)
-            } catch (_) {}
+            } catch (_) { }
           }
         }
       }
@@ -1271,11 +1271,11 @@ export async function transferSingleURL(
       if (filePath && fs.existsSync(filePath)) {
         try {
           fs.rmSync(filePath)
-        } catch (_) {}
+        } catch (_) { }
         if (fileDir && fileDir !== './cache' && fs.existsSync(fileDir)) {
           try {
             fs.rmdirSync(fileDir)
-          } catch (_) {}
+          } catch (_) { }
         }
       }
     }
