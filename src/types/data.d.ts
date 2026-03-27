@@ -25,4 +25,5 @@ export interface UserData {
   banned: boolean
   token: string
   batchProgress?: BatchProgressState
+  skipCatbox?: boolean
 }
