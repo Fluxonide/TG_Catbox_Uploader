@@ -611,12 +611,115 @@ function getCacheSizeMB(): number {
   return totalBytes / (1024 * 1024)
 }
 
+/**
+ * Evict the oldest files from the cache directory until usage drops below the limit.
+ * Returns the number of files deleted.
+ */
+function evictOldestCacheFiles(targetMB: number): number {
+  if (!fs.existsSync('./cache')) return 0
+
+  // Collect all files with their paths, sizes, and modification times
+  const files: { path: string; size: number; mtime: number }[] = []
+  const items = fs.readdirSync('./cache')
+
+  for (const item of items) {
+    const itemPath = `./cache/${item}`
+    try {
+      const stat = fs.statSync(itemPath)
+      if (stat.isFile()) {
+        files.push({ path: itemPath, size: stat.size, mtime: stat.mtimeMs })
+      } else if (stat.isDirectory()) {
+        // Collect files inside subdirectories too
+        try {
+          const subItems = fs.readdirSync(itemPath)
+          for (const subItem of subItems) {
+            const subPath = `${itemPath}/${subItem}`
+            try {
+              const subStat = fs.statSync(subPath)
+              if (subStat.isFile()) {
+                files.push({ path: subPath, size: subStat.size, mtime: subStat.mtimeMs })
+              }
+            } catch (_) { }
+          }
+        } catch (_) { }
+      }
+    } catch (_) { }
+  }
+
+  // Sort oldest first
+  files.sort((a, b) => a.mtime - b.mtime)
+
+  let currentBytes = files.reduce((sum, f) => sum + f.size, 0)
+  const targetBytes = targetMB * 1024 * 1024
+  let deleted = 0
+  const now = Date.now()
+  const SAFE_AGE_MS = 2 * 60 * 60 * 1000 // 2 hours — files newer than this are likely in active use
+
+  for (const file of files) {
+    if (currentBytes <= targetBytes) break
+    // Skip files that were modified recently — they're likely being actively downloaded/uploaded
+    if (now - file.mtime < SAFE_AGE_MS) {
+      log(`[Cache] Skipping active file: ${file.path} (modified ${Math.round((now - file.mtime) / 1000)}s ago)`)
+      continue
+    }
+    try {
+      fs.rmSync(file.path)
+      currentBytes -= file.size
+      deleted++
+      log(`[Cache] Evicted old file: ${file.path} (${(file.size / 1024 / 1024).toFixed(1)}MB)`)
+    } catch (_) { }
+  }
+
+  // Clean up empty subdirectories
+  if (deleted > 0) {
+    try {
+      for (const item of fs.readdirSync('./cache')) {
+        const itemPath = `./cache/${item}`
+        try {
+          const stat = fs.statSync(itemPath)
+          if (stat.isDirectory()) {
+            const contents = fs.readdirSync(itemPath)
+            if (contents.length === 0) {
+              fs.rmdirSync(itemPath)
+            }
+          }
+        } catch (_) { }
+      }
+    } catch (_) { }
+  }
+
+  return deleted
+}
+
 async function waitForCacheSpace(): Promise<void> {
   const maxMB = MAX_CACHE_MB
   let currentMB = getCacheSizeMB()
+
+  if (currentMB <= maxMB) return
+
+  // Actively evict oldest files first
+  log(`[Cache] Usage ${currentMB.toFixed(0)}MB exceeds limit ${maxMB}MB, evicting old files...`)
+  const evicted = evictOldestCacheFiles(maxMB)
+  currentMB = getCacheSizeMB()
+
+  if (evicted > 0) {
+    log(`[Cache] Evicted ${evicted} file(s), usage now ${currentMB.toFixed(0)}MB`)
+  }
+
+  // If still over limit after eviction, wait briefly (something is actively downloading)
+  // but with a hard timeout to prevent infinite loops
+  const maxWaitMs = 120_000 // 2 minutes max wait
+  const startTime = Date.now()
+
   while (currentMB > maxMB) {
-    log(`[Cache] Usage ${currentMB.toFixed(0)}MB exceeds limit ${maxMB}MB, waiting...`)
-    await new Promise(resolve => setTimeout(resolve, 3000))
+    if (Date.now() - startTime > maxWaitMs) {
+      log(`[Cache] ⚠️ Cache still at ${currentMB.toFixed(0)}MB after ${maxWaitMs / 1000}s, force-evicting...`)
+      evictOldestCacheFiles(Math.floor(maxMB * 0.7)) // Evict down to 70% capacity
+      currentMB = getCacheSizeMB()
+      break
+    }
+    log(`[Cache] Usage ${currentMB.toFixed(0)}MB exceeds limit ${maxMB}MB, waiting for active transfers...`)
+    await new Promise(resolve => setTimeout(resolve, 5000))
     currentMB = getCacheSizeMB()
   }
 }

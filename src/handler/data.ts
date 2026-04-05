@@ -72,23 +72,34 @@ export function cleanupOrphanTransferTasks() {
 
   // Find cache files and directories that were created before the bot was launched,
   // and delete them
-  const now = new Date()
-  const cacheItems = readdirSync('./cache', 'utf-8')
   let deletedCount = 0
-  
-  cacheItems.forEach(item => {
-    const itemPath = `./cache/${item}`
-    const stat = statSync(itemPath)
-    if (stat.birthtime < now) {
-      if (stat.isFile()) {
-        rmSync(itemPath)
-        deletedCount++
-      } else if (stat.isDirectory()) {
-        rmSync(itemPath, { recursive: true })
-        deletedCount++
-      }
+
+  if (existsSync('./cache')) {
+    try {
+      const now = new Date()
+      const cacheItems = readdirSync('./cache', 'utf-8')
+
+      cacheItems.forEach(item => {
+        const itemPath = `./cache/${item}`
+        try {
+          const stat = statSync(itemPath)
+          if (stat.birthtime < now) {
+            if (stat.isFile()) {
+              rmSync(itemPath)
+              deletedCount++
+            } else if (stat.isDirectory()) {
+              rmSync(itemPath, { recursive: true })
+              deletedCount++
+            }
+          }
+        } catch (e) {
+          log(`Failed to clean cache item ${itemPath}: ${e.message}`)
+        }
+      })
+    } catch (e) {
+      log(`Failed to read cache directory: ${e.message}`)
     }
-  })
+  }
 
   log(`Aborted ${userCount} transfer(s) and deleted ${deletedCount} orphan cache item(s)`)
 }
