@@ -444,8 +444,8 @@ async function processLogQueue() {
             }
 
             if (imageMsg) {
-              // Delay between preview and document to avoid flood
-              await new Promise(resolve => setTimeout(resolve, 1500))
+              // Delay between preview and document to avoid flood wait (messages.SendMedia limit is ~20/min)
+              await new Promise(resolve => setTimeout(resolve, 3000))
               let docFilePath = item.filePath
               let renamedPath: string | null = null
               if (item.result && item.result !== 'Skipped') {
@@ -545,8 +545,9 @@ async function processLogQueue() {
 
       log(`[Log] Successfully sent to log channel: ${item.url}`)
 
-      // Delay between log items (flood gate handles emergencies, this is just spacing)
-      await new Promise(resolve => setTimeout(resolve, 2500))
+      // Delay between log items (flood gate handles emergencies, this spacing prevents Telegram limits)
+      // We wait 4500ms to stay well under the ~20 messages/minute group send limit
+      await new Promise(resolve => setTimeout(resolve, 4500))
     } catch (e) {
       log(`Failed to send to log channel: ${e.message || e}`)
       const floodSec = getFloodWaitSeconds(e)
