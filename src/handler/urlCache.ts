@@ -29,8 +29,8 @@ export function getCachedUrl(originalUrl: string): string | undefined {
   return urlCache.get(originalUrl)
 }
 
-export function setCachedUrl(originalUrl: string, catboxUrl: string) {
-  urlCache.set(originalUrl, catboxUrl)
+export function setCachedUrl(originalUrl: string, cachedUrl: string) {
+  urlCache.set(originalUrl, cachedUrl)
   // Save per-item, could be batched but fine for now
   saveUrlCache()
 }

@@ -9,7 +9,7 @@ import {
   statSync,
   rmSync,
 } from 'fs'
-import { DEFAULT_LANG, DEFAULT_SERVICE, DEFAULT_EXPR } from '../env.js'
+import { DEFAULT_LANG } from '../env.js'
 import type { UserData } from '../types/data.js'
 
 export let chatData: Record<string, UserData> = {}
@@ -17,10 +17,7 @@ export const chatDataTemplate = {
   lang: DEFAULT_LANG,
   downloading: 0,
   total: 0,
-  service: DEFAULT_SERVICE,
-  lbe: DEFAULT_EXPR,
   banned: false,
-  token: '',
 }
 
 // console.log, with date added
@@ -47,15 +44,12 @@ export function saveBotData() {
   writeFileSync('./data/chatsList.json', JSON.stringify(chatData))
 }
 
-import { loadUrlCache } from './urlCache.js'
-
 export function loadBotData() {
   log('Loading bot data...')
   if (!existsSync('./data')) mkdirSync('./data')
   if (existsSync('./data/chatsList.json'))
     chatData = JSON.parse(readFileSync('./data/chatsList.json', 'utf-8')) || {}
   
-  loadUrlCache()
   log(`Loaded data from ${Object.keys(chatData).length} chat(s)`)
 }
 

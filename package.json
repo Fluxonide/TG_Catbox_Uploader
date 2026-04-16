@@ -1,7 +1,7 @@
 {
-  "name": "tg_catboxuploader",
-  "version": "2.0.0",
-  "description": "A simple Telegram bot to upload files to catbox.moe",
+  "name": "tg_log_uploader",
+  "version": "3.0.0",
+  "description": "A Telegram bot to upload files to a log channel",
   "main": "index.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -12,7 +12,7 @@
   "keywords": [
     "telegram",
     "bot",
-    "catbox"
+    "uploader"
   ],
   "author": "AnotiaWang",
   "license": "MIT",
@@ -21,7 +21,6 @@
     "big-integer": "^1.6.52",
     "dotenv": "^16.0.0",
     "mime-types": "^2.1.34",
-    "node-catbox": "^3.0.1",
     "pnpm": "^10.32.1",
     "sharp": "^0.34.5",
     "shelljs": "^0.10.0",

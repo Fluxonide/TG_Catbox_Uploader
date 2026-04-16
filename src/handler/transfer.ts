@@ -7,13 +7,10 @@ import sharp from 'sharp'
 // Disable sharp's internal cache to prevent memory buildup during batch processing
 sharp.cache(false)
 import { chatData, log } from './data.js'
-import { bot, BOT_NAME } from '../../index.js'
-import { Catbox, Litterbox } from 'node-catbox'
-import { getCachedUrl, setCachedUrl } from './urlCache.js'
+import { bot } from '../../index.js'
 import {
   MAX_DOWNLOADING,
   ADMIN_ID,
-  CATBOX_TOKEN,
   LOG_CHANNEL_ID,
   DOWNLOAD_DC_ID,
   DOWNLOAD_WORKERS,
@@ -86,8 +83,6 @@ interface LogQueueItem {
   chat: number
   index: number
   url: string
-  service: string
-  result: string | null
   filePath: string
   imageMsg: Api.Message | null
   resolve: () => void
@@ -256,7 +251,7 @@ async function processLogQueue() {
           await new Promise(resolve => setTimeout(resolve, 1500))
           await bot
             .sendMessage(LOG_CHANNEL_ID, {
-              message: `Service: ${item.service}\nResult: \`${item.result}\``,
+              message: `Source: Direct Upload`,
               replyTo: fwdMsg.id,
             })
             .catch((e) => {
@@ -281,7 +276,7 @@ async function processLogQueue() {
         }
       } else {
         // URL upload: we have the downloaded file locally
-        let captionStr = `Source: \`${item.url}\`\nService: ${item.service}\nResult: \`${item.result}\``
+        let captionStr = `Source: \`${item.url}\``
 
         log(
           `[Log] Sending URL upload to log channel: ${item.url}, file exists: ${item.filePath && fs.existsSync(item.filePath)}`,
@@ -448,21 +443,6 @@ async function processLogQueue() {
               await new Promise(resolve => setTimeout(resolve, 3000))
               let docFilePath = item.filePath
               let renamedPath: string | null = null
-              if (item.result && item.result !== 'Skipped') {
-                try {
-                  const catboxFilename = new URL(item.result).pathname.split('/').pop()
-                  if (catboxFilename) {
-                    const dir = item.filePath.substring(0, item.filePath.lastIndexOf('/'))
-                    renamedPath = `${dir}/${catboxFilename}`
-                    if (renamedPath !== item.filePath) {
-                      fs.copyFileSync(item.filePath, renamedPath)
-                      docFilePath = renamedPath
-                    } else {
-                      renamedPath = null
-                    }
-                  }
-                } catch (_) { }
-              }
               let docRetries = 3
               let docRetryDelay = 2000
               let docSent = false
@@ -557,7 +537,7 @@ async function processLogQueue() {
           await waitForFloodGate()
           await bot
             .sendMessage(LOG_CHANNEL_ID, {
-              message: `Source: \`${item.url}\`\nService: ${item.service}\nResult: \`${item.result}\`\n\n⚠️ Error: ${e.message || e}`,
+              message: `Source: \`${item.url}\`\n\n⚠️ Error: ${e.message || e}`,
             })
             .catch(() => null)
         } catch (_) { }
@@ -737,61 +717,54 @@ export async function transfer(msg: Api.Message) {
       message: i18n.t(lang, 'flood_protection', [MAX_DOWNLOADING.toString()]),
     })
 
-  let file: Api.TypeDocument | Api.TypePhoto | Api.TypeWebDocument
-  if (
-    'document' in msg.media &&
-    msg.media.document &&
-    msg.media.document.className === 'Document'
-  ) {
-    file = msg.media.document
-  } else if ('photo' in msg.media && msg.media.photo && msg.media.photo.className === 'Photo') {
-    file = msg.media.photo
-  } else {
+  // Validate supported media type
+  const hasDocument = 'document' in msg.media && msg.media.document && msg.media.document.className === 'Document'
+  const hasPhoto = 'photo' in msg.media && msg.media.photo && msg.media.photo.className === 'Photo'
+  if (!hasDocument && !hasPhoto) {
     return bot.sendMessage(chat, {
       message: i18n.t(lang, 'error_unsupportedFileType'),
       replyTo: msg.id,
     })
   }
-  const service = chatData[chat].service
-  let fileSize: number,
-    fileExt: string,
-    fileName = randomString(),
-    filePath: string
-
-  if (file.className === 'Photo') {
-    const lastSize = file.sizes[file.sizes.length - 1]
-
-    if ('sizes' in lastSize) fileSize = lastSize.sizes.slice(-1)[0]
-    else if ('size' in lastSize) fileSize = lastSize.size
-    else {
-      return bot.sendMessage(chat, {
-        message: i18n.t(lang, 'error_unsupportedFileType'),
-        replyTo: msg.id,
-      })
-    }
-    fileExt = 'jpg'
-  } else {
-    fileSize = file.size.toJSNumber()
-    if (file.mimeType === 'application/x-tgsticker') {
-      fileExt = 'tgs'
-      await bot.sendMessage(chat, {
-        message: i18n.t(lang, 'animatedStickers'),
-        parseMode: 'html',
-        linkPreview: false,
-      })
-    } else fileExt = mime.extension(file.mimeType) as string
-  }
-
-  if (
-    !chatData[chat].skipCatbox &&
-    ((service === 'Catbox' && fileSize > 200000000) ||
-      (service === 'Litterbox' && fileSize > 1000000000))
-  )
-    return bot.sendMessage(chat, {
-      message: i18n.t(lang, 'err_FileTooBig', [service]),
-    })
-
   chatData[chat].downloading++
+
+  // Extract file metadata
+  let fileName = randomString()
+  let fileExt = 'bin'
+  let fileSize = 0
+  let filePath = ''
+
+  if ('document' in msg.media && msg.media.document && msg.media.document.className === 'Document') {
+    const doc = msg.media.document
+    fileSize = typeof doc.size === 'object' ? doc.size.toJSNumber() : Number(doc.size)
+    // Get filename from attributes
+    for (const attr of doc.attributes) {
+      if (attr.className === 'DocumentAttributeFilename' && attr.fileName) {
+        const parts = attr.fileName.split('.')
+        if (parts.length > 1) {
+          fileExt = parts.pop()!
+          fileName = parts.join('.')
+        } else {
+          fileName = attr.fileName
+        }
+        break
+      }
+    }
+    // Fallback: get extension from mime type
+    if (fileExt === 'bin' && doc.mimeType) {
+      const ext = mime.extension(doc.mimeType)
+      if (ext) fileExt = ext
+    }
+  } else if ('photo' in msg.media && msg.media.photo && msg.media.photo.className === 'Photo') {
+    const photo = msg.media.photo
+    fileExt = 'jpg'
+    // Get the largest photo size
+    const sizes = (photo as any).sizes || []
+    if (sizes.length > 0) {
+      const largest = sizes[sizes.length - 1]
+      fileSize = largest.size || 0
+    }
+  }
 
   const editMsg = await bot.sendMessage(chat, {
     message: i18n.t(lang, 'downloading'),
@@ -880,66 +853,8 @@ export async function transfer(msg: Api.Message) {
 
     log(`Downloaded: ${filePath} (Size ${fileSize})`)
 
-    // Upload to Catbox / Litterbox
-    let result: string = 'Skipped'
-    let validity: string = 'N/A'
-
-    if (chatData[chat].skipCatbox) {
-      // Skip catbox upload — just update status
-      await bot.editMessage(chat, {
-        message: editMsg.id,
-        text: `<b>📤 Sending to log channel...</b>\n\n📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB`,
-        parseMode: 'html',
-      }).catch(() => { })
-    } else {
-      // Animated upload progress indicator (every 3s, skipped during flood pause)
-      let uploadFrame = 0
-      const uploadInterval = setInterval(() => {
-        if (isFloodPaused()) return // Skip animation during flood pause
-        uploadFrame++
-        const animPos = uploadFrame % 20
-        const bar = '░'.repeat(animPos) + '█' + '░'.repeat(19 - animPos)
-        const dots = '.'.repeat((uploadFrame % 3) + 1)
-        bot
-          .editMessage(chat, {
-            message: editMsg.id,
-            text:
-              `<b>📤 Uploading to ${service}${dots}</b>\n\n` +
-              `📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB\n` +
-              `<code>[${bar}]</code>`,
-            parseMode: 'html',
-          })
-          .catch(() => { })
-      }, 3000)
-
-      try {
-        if (service.toLowerCase() === 'catbox') {
-          validity = '∞'
-          const client = new Catbox(chatData[chat].token || CATBOX_TOKEN || '')
-          result = await client.uploadFile({ path: filePath })
-        } else {
-          const lbe = chatData[chat].lbe
-          const client = new Litterbox()
-
-          validity = `${lbe} ${i18n.t(lang, lbe === 1 ? 'hour' : 'hours')}`
-          result = await client.upload({
-            path: filePath,
-            duration: `${validity}h` as any,
-          })
-        }
-      } finally {
-        clearInterval(uploadInterval)
-      }
-    }
-    const text = chatData[chat].skipCatbox ?
-      `<b>✅ Downloaded successfully!</b>\n\n📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB\n⚠️ Catbox uploading was skipped.` :
-      i18n.t(lang, 'uploaded', [
-        service,
-        (fileSize / 1000 / 1000).toFixed(2),
-        validity,
-        result,
-        BOT_NAME,
-      ])
+    // Send success message to user
+    const text = `<b>✅ Downloaded successfully!</b>\n\n📁 Size: ${(fileSize / 1000 / 1000).toFixed(2)} MB`
     try {
       await bot.sendMessage(chat, {
         message: text,
@@ -964,7 +879,7 @@ export async function transfer(msg: Api.Message) {
       }
     }
     chatData[chat].total++
-    log(`Uploaded ${filePath} to ${service}`)
+    log(`Processed ${filePath} for log channel`)
     if (LOG_CHANNEL_ID) {
       // For direct file transfers, we don't have a URL, so we use a placeholder.
       // The index is used for ordering in the log queue.
@@ -976,8 +891,6 @@ export async function transfer(msg: Api.Message) {
       await sendToLogChannel(chat, {
         index: msg.id, // Use message ID as index for ordering
         url: `tg-file-${msg.id}`, // Unique identifier for dedup
-        service,
-        result,
         filePath,
         imageMsg: msg,
         resolve: resolveLogPromise!,
@@ -1037,14 +950,9 @@ export async function transferSingleURL(
   abortSignal?: AbortSignal,
 ): Promise<string | null> {
   if (msg.peerId.className !== 'PeerUser') return null
-  const chat = msg.peerId.userId.toJSNumber()
-  const service = chatData[chat].service
+
+  const chat = (msg.peerId as Api.PeerUser).userId.toJSNumber()
   let filePath = ''
-
-  chatData[chat].downloading++
-
-  // Check URL Cache first
-  const cachedCatboxUrl = getCachedUrl(url)
 
   if (!fs.existsSync('./cache')) fs.mkdirSync('./cache')
 
@@ -1144,39 +1052,10 @@ export async function transferSingleURL(
 
     // Get file size from Content-Length header
     const contentLength = response.headers.get('content-length')
-    const fileSize = contentLength ? parseInt(contentLength) : 0
+    const _fileSize = contentLength ? parseInt(contentLength) : 0
+    void _fileSize // Content-Length used for logging only
 
-    // Check file size limits (only when catbox upload is enabled)
-    if (fileSize > 0 && !chatData[chat].skipCatbox) {
-      if (
-        (service === 'Catbox' && fileSize > 200000000) ||
-        (service === 'Litterbox' && fileSize > 1000000000)
-      ) {
-        log(`[${logIndex}] File too big: ${url} (${fileSize} bytes)`)
-        // Log to channel even for oversized files
-        if (LOG_CHANNEL_ID) {
-          try {
-            let resolveLogPromise: () => void
-            const logPromise = new Promise<void>(resolve => {
-              resolveLogPromise = resolve
-            })
-            await sendToLogChannel(chat, {
-              index: logIndex,
-              url,
-              service,
-              result: null,
-              filePath: '',
-              imageMsg: msg,
-              resolve: resolveLogPromise!,
-            })
-            await logPromise
-          } catch (e) {
-            log(`[${logIndex}] Log error (non-fatal): ${e.message}`)
-          }
-        }
-        return null
-      }
-    }
+
 
     // Try to get original filename from URL
     const urlPath = new URL(url).pathname
@@ -1240,89 +1119,17 @@ export async function transferSingleURL(
     const finalFileSize = fs.statSync(filePath).size
     log(`[${logIndex}] Downloaded from URL: ${filePath} (Size ${finalFileSize})`)
 
-    // Check final file size (only when catbox upload is enabled)
-    if (
-      !chatData[chat].skipCatbox &&
-      ((service === 'Catbox' && finalFileSize > 200000000) ||
-        (service === 'Litterbox' && finalFileSize > 1000000000))
-    ) {
-      log(`[${logIndex}] Final file too big: ${filePath} (${finalFileSize} bytes)`)
-      if (LOG_CHANNEL_ID) {
-        try {
-          let resolveLogPromise: () => void
-          const logPromise = new Promise<void>(resolve => {
-            resolveLogPromise = resolve
-          })
-          await sendToLogChannel(chat, {
-            index: logIndex,
-            url,
-            service,
-            result: null,
-            filePath,
-            imageMsg: msg,
-            resolve: resolveLogPromise!,
-          })
-          await logPromise
-        } catch (e) {
-          log(`[${logIndex}] Log error (non-fatal): ${e.message}`)
-        }
-      }
-      return null
-    }
-
-    // Upload to Catbox / Litterbox with retry and animated progress
-    let result!: string
-    let isCached = false
+    // Bypass final file size checks since we upload natively only now
 
     // Check abort before upload
     if (abortSignal?.aborted) {
       throw new Error('Cancelled')
     }
 
-    if (chatData[chat].skipCatbox) {
-      log(`[${logIndex}] URL upload skipped due to user settings: ${url}`)
-      result = 'Skipped'
-    } else if (cachedCatboxUrl) {
-      log(`[${logIndex}] URL already uploaded, using cache: ${url} -> ${cachedCatboxUrl}`)
-      result = cachedCatboxUrl
-      isCached = true
-    } else {
-      let uploadRetries = 3
-      while (uploadRetries > 0) {
-        try {
-          if (service.toLowerCase() === 'catbox') {
-            const client = new Catbox(chatData[chat].token || CATBOX_TOKEN || '')
-            result = await client.uploadFile({ path: filePath })
-          } else {
-            const lbe = chatData[chat].lbe
-            const client = new Litterbox()
-            result = await client.upload({
-              path: filePath,
-              duration: `${lbe}h` as any,
-            })
-          }
-          break
-        } catch (e) {
-          uploadRetries--
-          if (uploadRetries > 0) {
-            log(`[${logIndex}] Upload failed, retrying... (${e.message})`)
-            await new Promise(resolve => setTimeout(resolve, 1500))
-          } else {
-            throw new Error(`Upload failed after retries: ${e.message}`)
-          }
-        }
-      }
-    }
-
-    const resultLine = chatData[chat].skipCatbox ?
-      `<code>${logIndex}.</code> Skipped upload (${(finalFileSize / 1000 / 1000).toFixed(2)} MB)` :
-      `<code>${logIndex}.</code> <a href="${result}">${(finalFileSize / 1000 / 1000).toFixed(2)} MB</a>`
+    const resultLine = `<code>${logIndex}.</code> Processed (${(finalFileSize / 1000 / 1000).toFixed(2)} MB)`
 
     chatData[chat].total++
-    log(`[${logIndex}] Processed ${filePath} from URL for ${service}: ${result}`)
-
-    // Save to cache for deduplication
-    if (!isCached && !chatData[chat].skipCatbox) setCachedUrl(url, result)
+    log(`[${logIndex}] Processed ${filePath} from URL`)
 
     // Ensure bot is connected before sending to log
     if (LOG_CHANNEL_ID && !bot.connected) {
@@ -1346,8 +1153,6 @@ export async function transferSingleURL(
         await sendToLogChannel(chat, {
           index: logIndex,
           url,
-          service,
-          result,
           filePath,
           imageMsg: msg,
           resolve: resolveLogPromise!,
@@ -1391,7 +1196,7 @@ export async function transferSingleURL(
     // Log failed downloads to the log channel too
     if (LOG_CHANNEL_ID) {
       try {
-        await sendFailedToLogChannel(chat, logIndex, url, service, e.message || 'Unknown error')
+        await sendFailedToLogChannel(chat, logIndex, url, e.message || 'Unknown error')
       } catch (logError) {
         log(`[${logIndex}] Failed to send error log (non-fatal): ${logError.message}`)
       }
@@ -1413,7 +1218,6 @@ async function sendFailedToLogChannel(
   chat: number,
   index: number,
   url: string,
-  service: string,
   error: string,
 ) {
   if (!LOG_CHANNEL_ID) return
@@ -1421,7 +1225,7 @@ async function sendFailedToLogChannel(
     await waitForFloodGate()
     await bot
       .sendMessage(LOG_CHANNEL_ID, {
-        message: `❌ <b>Failed Upload</b>\nFrom: <code>${chat}</code>\nURL: <code>${url}</code>\nService: ${service}\nError: <code>${error}</code>\nIndex: ${index}`,
+        message: `❌ <b>Failed Upload</b>\nFrom: <code>${chat}</code>\nURL: <code>${url}</code>\nError: <code>${error}</code>\nIndex: ${index}`,
         parseMode: 'html',
       })
       .catch((e) => {

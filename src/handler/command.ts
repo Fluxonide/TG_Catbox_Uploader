@@ -1,7 +1,6 @@
 import i18n from '../i18n/index.js'
 import * as buttons from './buttons.js'
 import { bot, BOT_NAME } from '../../index.js'
-import { Catbox } from 'node-catbox'
 import { chatData, saveBotData } from './data.js'
 import { ADMIN_ID, LOG_CHANNEL_ID, PARALLEL_DOWNLOADS } from '../env.js'
 import type { Api } from 'telegram'
@@ -349,69 +348,6 @@ class GeneralCommands {
     })
   }
 
-  async delete(link: string) {
-    if (link) {
-      // Parse the filename if it's a link
-      if (link.startsWith('http')) {
-        link = new URL(link).pathname.substring(1)
-      }
-      if (chatData[this.chat].token) {
-        let result = ''
-        const catbox = new Catbox(chatData[this.chat].token)
-
-        try {
-          await catbox.deleteFiles({ files: [link] })
-          await bot.sendMessage(this.chat, { message: i18n.t(this.lang, 'deleteFileSuccess') })
-        } catch (e) {
-          console.error(`Delete file ${link} failed:`, e)
-          if (e.message.includes("doesn't exist")) {
-            result = i18n.t(this.lang, 'operationFailed', [i18n.t(this.lang, 'fileNotFound')])
-          } else if (e.message.includes("didn't belong to")) {
-            result = i18n.t(this.lang, 'operationFailed', [i18n.t(this.lang, 'fileWrongOwnership')])
-          } else result = i18n.t(this.lang, 'unknownError')
-          await bot.sendMessage(this.chat, { message: result })
-        }
-      } else
-        await bot.sendMessage(this.chat, {
-          message: i18n.t(this.lang, 'err_TokenNeeded'),
-          parseMode: 'html',
-          linkPreview: false,
-        })
-    } else
-      await bot.sendMessage(this.chat, {
-        message: i18n.t(this.lang, 'help_delete'),
-        parseMode: 'html',
-      })
-  }
-
-  async token(token: string) {
-    if (token) {
-      chatData[this.chat].token = token
-      await bot.sendMessage(this.chat, { message: i18n.t(this.lang, 'setSuccess') })
-    } else {
-      await bot.sendMessage(this.chat, {
-        message: i18n.t(this.lang, 'help_token', [chatData[this.chat].token || '🚫']),
-        parseMode: 'html',
-        linkPreview: false,
-      })
-    }
-  }
-
-  async skipcat() {
-    chatData[this.chat].skipCatbox = true
-    await bot.sendMessage(this.chat, {
-      message: '✅ Catbox uploading will be skipped. Files will only be saved to the log channel.',
-      parseMode: 'html',
-    })
-  }
-
-  async upcat() {
-    chatData[this.chat].skipCatbox = false
-    await bot.sendMessage(this.chat, {
-      message: '✅ Catbox uploading has been re-enabled.',
-      parseMode: 'html',
-    })
-  }
 
   async cancel() {
     const progressState = chatData[this.chat].batchProgress

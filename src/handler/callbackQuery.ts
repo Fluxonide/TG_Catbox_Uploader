@@ -3,7 +3,6 @@ import * as buttons from './buttons.js'
 import { bot } from '../../index.js'
 import { chatData, initChatData, saveBotData } from './data.js'
 import type { Api } from 'telegram'
-import type { LitterboxExpiration, StorageService } from '../types/data.js'
 import type { CallbackQueryEvent } from 'telegram/events/CallbackQuery.js'
 
 // Callback query handler
@@ -27,26 +26,6 @@ export async function handleCallbackQuery(event: CallbackQueryEvent) {
       bt = buttons.setLanguage(lang)
       text = `<b>${i18n.t(lang, 'settings_setLang')}</b>\n\n` + i18n.t(lang, 'help_setLang')
     }
-  } else if (data.startsWith('setService')) {
-    if (arg) chatData[chat].service = arg as StorageService
-    else {
-      bt = buttons.setService(chat)
-      text = `<b>${i18n.t(lang, 'settings_setService')}</b>\n\n` + i18n.t(lang, 'help_setService')
-    }
-  }
-  // Set Litterbox Expiration
-  else if (data.startsWith('setLBE')) {
-    if (arg) chatData[chat].lbe = parseInt(arg) as LitterboxExpiration
-    else {
-      bt = buttons.setLitterBoxExpiration(lang, chat)
-      text = `<b>${i18n.t(lang, 'settings_setExpr')}</b>\n\n` + i18n.t(lang, 'help_setExpr')
-    }
-  } else if (data.startsWith('setToken')) {
-    if (arg && arg === 'unbind') chatData[chat].token = ''
-    text =
-      `<b>${i18n.t(lang, 'token')}</b>\n\n` +
-      i18n.t(lang, 'help_token', [chatData[chat].token || '🚫'])
-    bt = buttons.setToken(chat)
   } else if (data.startsWith('refresh')) {
     // Handle refresh button for batch progress
     const progressState = chatData[chat].batchProgress
